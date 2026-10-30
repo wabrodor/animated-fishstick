@@ -180,6 +180,7 @@ function ApexHome() {
               <div className="apex-dashboard-row-content">
                 <b>{patientLabel(item.patientId)}</b>
                 <span>Call status: {(item.coordinatorCallStatus || 'PENDING').replaceAll('_', ' ')}</span>
+                <span>General history: {item.generalHistoryStatus?.replaceAll('_', ' ') || 'NOT RETURNED BY API'}</span>
                 <small>Due: {displayDate(item.coordinatorCallDueAt)}</small>
               </div>
               <Link className="secondary compact-action" href="/apex/queue">Open <ArrowUpRight size={13} /></Link>
@@ -218,6 +219,10 @@ function ApexHome() {
               <div className="apex-history-step"><span>1</span><div><b>Ask a clear Yes / No question</b><small>Allow Unknown or Declined when the patient cannot or does not wish to answer.</small></div></div>
               <div className="apex-history-step"><span>2</span><div><b>Show conditional follow-ups</b><small>If symptoms are present, collect duration, onset, severity and associated symptoms.</small></div></div>
               <div className="apex-history-step"><span>3</span><div><b>Record a trustworthy baseline</b><small>Cover past medical, family, social, allergy, relevant reproductive and prior investigation history.</small></div></div>
+            </div>
+            <div className="apex-history-note">
+              <ShieldCheck size={17} aria-hidden="true" />
+              <p>Queue API history status: {queueItems.filter((item) => Boolean(item.generalHistoryStatus)).length} of {queueItems.length} records currently return this field; {queueItems.filter((item) => item.generalHistoryStatus === 'COMPLETED').length} completed, {queueItems.filter((item) => item.generalHistoryStatus === 'IN_PROGRESS').length} in progress, and {queueItems.filter((item) => item.generalHistoryStatus === 'PENDING_REVIEW').length} pending clinician review. Missing values are shown as “NOT RETURNED BY API”, not assumed to be “NOT_STARTED”.</p>
             </div>
             <div className="apex-history-note"><ShieldCheck size={17} aria-hidden="true" /><p>History status and save actions are not wired yet: the current API supports call outcomes only. This panel is the dashboard preparation, not a claim that history has been collected.</p></div>
             <Link className="secondary full-action" href="/apex/queue">Continue with patient handoffs <ArrowUpRight size={14} /></Link>
