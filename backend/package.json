@@ -8,6 +8,7 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/server.js",
     "seed": "tsx scripts/seed.ts",
+    "seed:demo-reset": "tsx scripts/reset-and-seed-demo.ts",
     "typecheck": "tsc --noEmit",
     "worker": "tsx workers/reminder.worker.ts",
     "test": "vitest run",
@@ -17,7 +18,7 @@
     "node": ">=20"
   },
   "dependencies": {
-    "@aws-sdk/client-s3": "^3.940.0",
+    "@aws-sdk/client-s3": "^3.1160.0",
     "bcrypt": "^6.0.0",
     "bullmq": "^5.58.5",
     "cors": "^2.8.5",

@@ -5,6 +5,8 @@ import { generateHypertensionCarePlanDraft } from '../ai-care-plan.js';
 import { analyzePrescriptionImage, verifySubmittedMedicationList } from '../prescription-analysis.js';
 import { openMedicationClinicalReview } from '../clinical-review.js';
 import { enqueueOutboxEvent } from '../outbox.js';
+import { medicalDocumentStructuring } from '../config.js';
+import { PRESCRIPTION_STRUCTURING_PROMPT_VERSION, PRESCRIPTION_STRUCTURING_SCHEMA_VERSION } from '../prescription-analysis.js';
 
 import { connectDatabase, disconnectDatabase } from '../db.js';
 import { processOutboxBatch } from '../outbox-dispatcher.js';
@@ -60,6 +62,9 @@ async function startWorkers() {
       if (job.name === 'analyze-prescription-image') {
         const document = await PrescriptionDocument.findOne({ _id: job.data.documentId, source: 'IMAGE', analysisStatus: 'PENDING', status: 'ANALYZING' });
         if (!document) return;
+        document.processingStage = 'OCR';
+        document.processingAttempts = (document.processingAttempts ?? 0) + 1;
+        await document.save();
 
         const draft = await MedicationDraft.findOne({ prescriptionDocumentId: document._id }).sort({ createdAt: -1 });
         if (!draft) {
@@ -73,7 +78,7 @@ async function startWorkers() {
           return;
         }
 
-        const analysis = await analyzePrescriptionImage(document.storageKey, document.mimeType);
+        const analysis = await analyzePrescriptionImage(document.storageKey, document.mimeType, document.storageProvider);
         draft.rawText = analysis.rawText;
         draft.medications = analysis.medications;
         draft.status = 'VERIFICATION_REQUIRED';
@@ -86,6 +91,18 @@ async function startWorkers() {
         document.analysisStatus = analysis.status === 'COMPLETED' ? 'COMPLETED' : 'FAILED';
         document.status = analysis.status === 'COMPLETED' ? 'VERIFICATION_REQUIRED' : 'NEEDS_CLINICAL_REVIEW';
         document.clinicalReviewReason = draft.clinicalReviewReason;
+        document.ocrLines = analysis.ocrLines ?? [];
+        document.ocrFullText = analysis.rawText;
+        document.ocrWarningCode = analysis.ocrWarningCode;
+        document.ocrEngine = analysis.status === 'UNAVAILABLE' ? undefined : 'PADDLEOCR';
+        document.ocrEngineVersion = analysis.status === 'UNAVAILABLE' ? undefined : '2.9.1';
+        document.ocrProcessedAt = analysis.status === 'UNAVAILABLE' ? undefined : new Date();
+        document.structuringProvider = medicalDocumentStructuring.enabled && Boolean(analysis.rawText) ? 'DEEPSEEK' : undefined;
+        document.structuringModel = document.structuringProvider ? medicalDocumentStructuring.model : undefined;
+        document.structuringPromptVersion = document.structuringProvider ? PRESCRIPTION_STRUCTURING_PROMPT_VERSION : undefined;
+        document.structuringSchemaVersion = document.structuringProvider ? PRESCRIPTION_STRUCTURING_SCHEMA_VERSION : undefined;
+        document.processingStage = analysis.status === 'COMPLETED' ? 'COMPLETED' : 'FAILED';
+        document.safeLastErrorCode = analysis.status === 'COMPLETED' ? undefined : 'OCR_OR_STRUCTURING_FAILED';
         await document.save();
         const analyzedPatient = await Patient.findOne({ _id: document.patientId, organizationId: document.clinicOrganizationId, status: 'ACTIVE' }).select('assignedClinicianId name').lean();
         if (analyzedPatient?.assignedClinicianId) {
@@ -135,6 +152,7 @@ async function startWorkers() {
             confidence: medication.confidence,
             sourceText: medication.sourceText,
           })),
+          document.storageProvider,
         );
 
         draft.clinicalReviewRequired = verification.clinicalReviewRequired || verification.status !== 'COMPLETED';
@@ -259,10 +277,10 @@ async function startWorkers() {
     'apexcare-lab-processing',
     async (job) => {
       if (job.name === 'extract-lab-pdf') {
-        return processLabDocumentExtraction(String(job.data.documentId));
+        return processLabDocumentExtraction(String(job.data.documentId), new Date(), Number(job.data.processingVersion ?? 1));
       }
       if (job.name === 'structure-lab-results') {
-        return processLabResultStructuring(String(job.data.documentId));
+        return processLabResultStructuring(String(job.data.documentId), new Date(), Number(job.data.processingVersion ?? 1));
       }
       if (job.name === 'interpret-lab-results') {
         return processLabInterpretation(String(job.data.documentId), { organizationId: String(job.data.organizationId), patientId: String(job.data.patientId), apexcareOrganizationId: String(job.data.apexcareOrganizationId) });
@@ -424,7 +442,13 @@ async function startWorkers() {
         assessmentId,
       );
       if (!result || 'error' in result) {
-        throw new UnrecoverableError(`Care-plan generation failed: ${result && 'error' in result ? result.error : 'NOT_GENERATED'}`);
+        const failureCode = result && 'error' in result ? result.error : 'NOT_GENERATED';
+        // Enrollment/history writes may become visible just after a queued job starts.
+        // Keep the context gate strict, but let BullMQ's bounded retry policy re-check it.
+        if (failureCode === 'CARE_PLAN_GENERATION_CONTEXT_INVALID') {
+          throw new Error(`Care-plan generation failed: ${failureCode}`);
+        }
+        throw new UnrecoverableError(`Care-plan generation failed: ${failureCode}`);
       }
 
       const updated = await ApexCareEnrollment.updateOne(

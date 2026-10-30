@@ -189,12 +189,14 @@ export async function scheduleLabDocumentExtraction(input: {
   organizationId: string;
   patientId: string;
   apexcareOrganizationId: string;
+  processingVersion?: number;
 }): Promise<string> {
+  const processingVersion = input.processingVersion ?? 1;
   const job = await labProcessingQueue.add(
     'extract-lab-pdf',
-    input,
+    { ...input, processingVersion },
     {
-      jobId: `lab-extraction-${input.documentId}`,
+      jobId: `lab-extraction-${input.documentId}-v${processingVersion}`,
       removeOnComplete: 1000,
       removeOnFail: 5000,
       attempts: 3,
@@ -205,12 +207,13 @@ export async function scheduleLabDocumentExtraction(input: {
 }
 
 
-export async function scheduleLabResultStructuring(input: { documentId: string; organizationId: string; patientId: string; apexcareOrganizationId: string }): Promise<string> {
+export async function scheduleLabResultStructuring(input: { documentId: string; organizationId: string; patientId: string; apexcareOrganizationId: string; processingVersion?: number }): Promise<string> {
+  const processingVersion = input.processingVersion ?? 1;
   const job = await labProcessingQueue.add(
     'structure-lab-results',
-    input,
+    { ...input, processingVersion },
     {
-      jobId: `lab-structure-${input.documentId}`,
+      jobId: `lab-structure-${input.documentId}-v${processingVersion}`,
       removeOnComplete: 1000,
       removeOnFail: 5000,
       attempts: 3,
@@ -221,12 +224,13 @@ export async function scheduleLabResultStructuring(input: { documentId: string; 
 }
 
 
-export async function scheduleLabInterpretation(input: { documentId: string; organizationId: string; patientId: string; apexcareOrganizationId: string }): Promise<string> {
+export async function scheduleLabInterpretation(input: { documentId: string; organizationId: string; patientId: string; apexcareOrganizationId: string; processingVersion?: number }): Promise<string> {
+  const processingVersion = input.processingVersion ?? 1;
   const job = await labProcessingQueue.add(
     'interpret-lab-results',
-    input,
+    { ...input, processingVersion },
     {
-      jobId: `lab-interpretation-${input.documentId}`,
+      jobId: `lab-interpretation-${input.documentId}-v${processingVersion}`,
       removeOnComplete: 1000,
       removeOnFail: 5000,
       attempts: 3,

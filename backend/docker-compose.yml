@@ -1,13 +1,33 @@
 services:
+  paddleocr:
+    profiles: ["ocr"]
+    build:
+      context: ../services/paddleocr
+    container_name: apexcare-paddleocr
+    environment:
+      OCR_INTERNAL_TOKEN: ${PRESCRIPTION_OCR_API_KEY:?Set PRESCRIPTION_OCR_API_KEY in the backend environment}
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - paddleocr-models:/home/ocr/.paddleocr
+    restart: unless-stopped
+    init: true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10m
   mongo:
     image: mongo:8
     ports:
-      - "27017:27017"
+      - "127.0.0.1:27017:27017"
     volumes:
       - mongo-data:/data/db
   redis:
     image: redis:7-alpine
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
 volumes:
   mongo-data:
+  paddleocr-models:

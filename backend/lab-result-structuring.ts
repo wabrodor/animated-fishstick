@@ -1,7 +1,23 @@
 import { LabDocument, LabResult } from './models.js';
+import { medicalDocumentStructuring } from './config.js';
+import { extractLabCandidatesWithDeepSeek } from './lab-ai-extraction.js';
+import { enqueueOutboxEvent } from './outbox.js';
 
-export const LAB_RESULT_PARSER_VERSION = 1;
+export const LAB_RESULT_PARSER_VERSION = 2;
+const LAB_EXTRACTION_PROMPT_VERSION = 'lab-extraction-v1';
+const LAB_EXTRACTION_SCHEMA_VERSION = 'lab-candidate-v1';
 const PROCESSING_LEASE_MS = 10 * 60 * 1000;
+
+async function enqueueStructuredResults(document: { _id: unknown; clinicOrganizationId: unknown; patientId: unknown; apexcareOrganizationId: unknown }, processingVersion: number) {
+  await enqueueOutboxEvent({
+    organizationId: String(document.clinicOrganizationId),
+    eventKey: `LAB_RESULTS_STRUCTURED:${String(document._id)}:p${processingVersion}`,
+    eventType: 'LAB_RESULTS_STRUCTURED',
+    aggregateType: 'LabDocument',
+    aggregateId: String(document._id),
+    payload: { documentId: String(document._id), patientId: String(document.patientId), clinicOrganizationId: String(document.clinicOrganizationId), apexcareOrganizationId: String(document.apexcareOrganizationId), processingVersion },
+  });
+}
 
 const KNOWN_TESTS = [
   { canonical: 'HBA1C', aliases: ['HBA1C', 'HB A1C', 'GLYCATED HEMOGLOBIN', 'GLYCOSYLATED HEMOGLOBIN'] },
@@ -156,33 +172,46 @@ export function parseStructuredLabResults(extractedText: string) {
   return results;
 }
 
-export async function claimLabResultStructuring(documentId: string, now = new Date()) {
+export async function claimLabResultStructuring(documentId: string, now = new Date(), processingVersion = 1) {
   const staleBefore = new Date(now.getTime() - PROCESSING_LEASE_MS);
+  const generationFilter = processingVersion === 1 ? { $or: [{ processingVersion: 1 }, { processingVersion: { $exists: false } }] } : { processingVersion };
   return LabDocument.findOneAndUpdate(
     {
       _id: documentId,
+      $and: [generationFilter],
       extractionStatus: 'COMPLETED',
       $or: [
         { structuringStatus: { $in: ['NOT_STARTED', 'FAILED'] } },
         { structuringStatus: 'PROCESSING', structuringStartedAt: { $lte: staleBefore } },
       ],
     },
-    { $set: { structuringStatus: 'PROCESSING', structuringStartedAt: now, structuringError: undefined } },
+    { $set: { structuringStatus: 'PROCESSING', structuringStartedAt: now, structuringError: undefined, processingStage: 'AI_EXTRACTION' }, $inc: { processingAttempts: 1 } },
     { new: true },
   ).lean();
 }
 
-export async function processLabResultStructuring(documentId: string, now = new Date()) {
-  const document = await claimLabResultStructuring(documentId, now);
-  if (!document) return { processed: false, idempotent: true };
+export async function processLabResultStructuring(documentId: string, now = new Date(), processingVersion = 1) {
+  const document = await claimLabResultStructuring(documentId, now, processingVersion);
+  if (!document) {
+    const completed = await LabDocument.findOne({ _id: documentId, ...(processingVersion === 1 ? { $or: [{ processingVersion: 1 }, { processingVersion: { $exists: false } }] } : { processingVersion }), extractionStatus: 'COMPLETED', structuringStatus: 'COMPLETED' }).select('_id clinicOrganizationId patientId apexcareOrganizationId').lean();
+    if (completed) await enqueueStructuredResults(completed, processingVersion);
+    return { processed: false, idempotent: true };
+  }
 
   try {
-    const parsed = parseStructuredLabResults(document.extractedText ?? '');
-    if (parsed.length === 0) throw new Error('LAB_NO_STRUCTURED_RESULTS');
+    const extractedText = document.extractedText ?? '';
+    const ocrLines = (document.ocrLines ?? []).map((line) => ({
+      text: line.text,
+      ...(line.confidence != null ? { confidence: line.confidence } : {}),
+      page: line.page ?? 1,
+    }));
+    const parsed = medicalDocumentStructuring.enabled
+      ? await extractLabCandidatesWithDeepSeek(extractedText, ocrLines)
+      : parseStructuredLabResults(extractedText);
 
     const operations = parsed.map((result) => ({
       updateOne: {
-        filter: { organizationId: document.clinicOrganizationId, resultKey: `${document._id}:${LAB_RESULT_PARSER_VERSION}:${result.normalizedTestName}:${result.occurrence}` },
+        filter: { organizationId: document.clinicOrganizationId, resultKey: `${document._id}:${LAB_RESULT_PARSER_VERSION}:p${processingVersion}:${result.normalizedTestName}:${result.occurrence}` },
         update: {
           $setOnInsert: {
             organizationId: document.clinicOrganizationId,
@@ -199,26 +228,31 @@ export async function processLabResultStructuring(documentId: string, now = new 
             referenceRangeText: result.referenceRangeText,
             abnormalFlag: result.abnormalFlag,
             sourceText: result.sourceText,
+            sourcePage: 'sourcePage' in result ? result.sourcePage : undefined,
             extractionConfidence: result.extractionConfidence,
+            extractionMethod: medicalDocumentStructuring.enabled ? 'DEEPSEEK' as const : 'DETERMINISTIC_RULES' as const,
+            extractionModel: medicalDocumentStructuring.enabled ? medicalDocumentStructuring.model : undefined,
             parserVersion: LAB_RESULT_PARSER_VERSION,
-            resultKey: `${document._id}:${LAB_RESULT_PARSER_VERSION}:${result.normalizedTestName}:${result.occurrence}`,
+            resultKey: `${document._id}:${LAB_RESULT_PARSER_VERSION}:p${processingVersion}:${result.normalizedTestName}:${result.occurrence}`,
           },
         },
         upsert: true,
       },
     }));
     if (operations.length) await LabResult.bulkWrite(operations, { ordered: false });
+    await LabResult.updateMany({ organizationId: document.clinicOrganizationId, labDocumentId: document._id, reviewStatus: 'UNVERIFIED', resultKey: { $not: { $regex: `:p${processingVersion}:` } } }, { $set: { reviewStatus: 'SUPERSEDED' } });
 
     await LabDocument.updateOne(
-      { _id: document._id, clinicOrganizationId: document.clinicOrganizationId, extractionStatus: 'COMPLETED', structuringStatus: 'PROCESSING' },
-      { $set: { structuringStatus: 'COMPLETED', structuringVersion: LAB_RESULT_PARSER_VERSION, structuredAt: now, structuredResultCount: parsed.length, structuringError: undefined }, $unset: { structuringStartedAt: 1 } },
+      { _id: document._id, clinicOrganizationId: document.clinicOrganizationId, $and: [processingVersion === 1 ? { $or: [{ processingVersion: 1 }, { processingVersion: { $exists: false } }] } : { processingVersion }], extractionStatus: 'COMPLETED', structuringStatus: 'PROCESSING' },
+      { $set: { structuringStatus: 'COMPLETED', structuringProvider: medicalDocumentStructuring.enabled ? 'DEEPSEEK' : 'DETERMINISTIC_RULES', structuringModel: medicalDocumentStructuring.enabled ? medicalDocumentStructuring.model : undefined, structuringPromptVersion: medicalDocumentStructuring.enabled ? LAB_EXTRACTION_PROMPT_VERSION : undefined, structuringSchemaVersion: LAB_EXTRACTION_SCHEMA_VERSION, structuringVersion: LAB_RESULT_PARSER_VERSION, structuredAt: now, structuredResultCount: parsed.length, structuringError: undefined, extractionWarningCode: parsed.length === 0 ? (document.extractionWarningCode ?? 'NO_LAB_CANDIDATES') : document.extractionWarningCode, processingStage: 'COMPLETED', safeLastErrorCode: undefined }, $unset: { structuringStartedAt: 1 } },
     );
+    await enqueueStructuredResults(document, processingVersion);
     return { processed: true, idempotent: false, resultCount: parsed.length };
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'LAB_RESULT_STRUCTURING_FAILED';
+    const message = error instanceof Error && /^[A-Z0-9_:-]+$/.test(error.message) ? error.message : 'LAB_RESULT_STRUCTURING_FAILED';
     await LabDocument.updateOne(
-      { _id: document._id, structuringStatus: 'PROCESSING' },
-      { $set: { structuringStatus: 'FAILED', structuringError: message.slice(0, 1000) }, $unset: { structuringStartedAt: 1 } },
+      { _id: document._id, $and: [processingVersion === 1 ? { $or: [{ processingVersion: 1 }, { processingVersion: { $exists: false } }] } : { processingVersion }], structuringStatus: 'PROCESSING' },
+      { $set: { structuringStatus: 'FAILED', structuringError: message.slice(0, 1000), processingStage: 'FAILED', safeLastErrorCode: 'LAB_STRUCTURING_FAILED' }, $unset: { structuringStartedAt: 1 } },
     );
     throw error;
   }

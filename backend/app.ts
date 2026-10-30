@@ -12,7 +12,7 @@ app.disable('x-powered-by');
 app.set('trust proxy', env.TRUST_PROXY);
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use((_req, res, next) => { res.setHeader('Cache-Control', 'no-store'); next(); });
-app.use(cors({ origin: (origin, callback) => callback(null, !origin || allowedOrigins.includes(origin)), methods: ['GET', 'POST', 'PATCH'], allowedHeaders: ['Content-Type', 'Authorization'] }));
+app.use(cors({ origin: (origin, callback) => callback(null, !origin || allowedOrigins.includes(origin)), methods: ['GET', 'POST',    'PUT', 'PATCH'], allowedHeaders: ['Content-Type', 'Authorization'] }));
 app.use(express.json({ limit: '8mb', strict: true }));
 
 const authRateLimit = rateLimit({

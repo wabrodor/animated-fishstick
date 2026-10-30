@@ -63,6 +63,15 @@ export default function CareQueue() {
     return Boolean(dueAt && new Date(dueAt).getTime() < Date.now()) || Boolean(referral?.staffEscalatedAt || item.staffEscalatedAt);
   };
   const urgentEnrollmentCount = (diagnoses || []).filter(isUrgentEnrollment).length;
+  const filterCounts: Record<Filter, number> = {
+    ALL: openCount,
+    URGENT: highTasks.length + highReviews.length + escalations.length + urgentEnrollmentCount,
+    REVIEWS: reviews?.length ?? 0,
+    CARE_TASKS: q?.tasks.length ?? 0,
+    ENROLLMENT: diagnoses?.length ?? 0,
+    ESCALATIONS: escalations.length,
+    SERVICES: cases.length,
+  };
   const normalizedSearch = search.trim().toLowerCase();
   const matches = (values: Array<string | undefined | null>) => !normalizedSearch || values.some((value) => String(value ?? "").toLowerCase().includes(normalizedSearch));
 
@@ -114,7 +123,7 @@ export default function CareQueue() {
 
     {error && <div className="card glass alert-error section page-enter"><b>Some work could not be completed.</b><p>{error}</p><button className="secondary" onClick={() => void load(true)}>Retry loading</button></div>}
     {!q || !diagnoses || !reviews ? <div className="grid g3 section">{[1,2,3].map((i) => <div className="card glass skeleton-stat" key={i} />)}</div> : <>
-      {/* <section className="grid g4 section coordinator-stat-grid">
+      <section className="grid g4 section coordinator-stat-grid">
         <div className="card glass stat"><ClipboardList size={18} /><small>Open work items</small><strong>{openCount}</strong><span className="muted">Across all coordinator queues</span></div>
         <div className="card glass stat"><AlertTriangle size={18} /><small>Act now</small><strong>{highTasks.length + highReviews.length + escalations.length + diagnoses.filter(isUrgentEnrollment).length}</strong><span className="muted">High-priority work and escalations</span></div>
         <div className="card glass stat"><CalendarClock size={18} /><small>Overdue visits</small><strong>{q.counts.overdueVisits}</strong><span className="muted">Care queue backend count</span></div>
@@ -125,11 +134,11 @@ export default function CareQueue() {
         <div className="card glass stat"><ClipboardList size={18} /><small>Pending reviews</small><strong>{q.counts.pendingReviews}</strong><span className="muted">Backend review count</span></div>
         <div className="card glass stat"><UserPlus size={18} /><small>New enrollment</small><strong>{diagnoses.length}</strong><span className="muted">Clinician referrals awaiting staff</span></div>
         <div className="card glass stat"><ShieldAlert size={18} /><small>Open escalations</small><strong>{escalations.length}</strong><span className="muted">{cases.length} service requests also open</span></div>
-      </section> */}
+      </section>
 
       <section className="card glass section page-enter">
         <div className="section-head"><div><div className="eyebrow">Find the next task</div><h2>Worklist</h2><span className="muted">Filter by workflow or search patient, MRN, task, status or service reason.</span></div><span className="badge blue">{openCount} items</span></div>
-        <div className="coordinator-filter-row">{FILTERS.map((item) => <button key={item.id} className={`coordinator-filter ${filter === item.id ? "active" : ""}`} onClick={() => setFilter(item.id)}>{item.label}{item.id === "URGENT" && <span>{highTasks.length + highReviews.length + escalations.length + urgentEnrollmentCount}</span>}</button>)}</div>
+        <div className="coordinator-filter-row">{FILTERS.map((item) => <button key={item.id} className={`coordinator-filter ${filter === item.id ? "active" : ""} ${filterCounts[item.id] ? "has-items" : ""}`} onClick={() => setFilter(item.id)}>{item.label}<span className="coordinator-filter-count">{filterCounts[item.id]}</span></button>)}</div>
         <label className="coordinator-search"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search patient, MRN, task or status…" /><button type="button" onClick={() => setSearch("")} aria-label="Clear search" disabled={!search}><XCircle size={15} /></button></label>
       </section>
 

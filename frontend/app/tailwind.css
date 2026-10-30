@@ -1,0 +1,6 @@
+@import 'tailwindcss';
+@import '../styles/base.css';
+@import '../styles/patient-workspace.css';
+@import '../styles/role-workspaces.css';
+@import '../styles/care-queue.css';
+@import '../styles/history-intake.css';

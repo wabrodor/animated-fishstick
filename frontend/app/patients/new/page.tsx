@@ -49,8 +49,7 @@ export default function NewPatientPage() {
   const [lastName, setLastName] =
     useState('');
 
-  const [dateOfBirth, setDateOfBirth] =
-    useState('');
+  const [ageAtRegistration, setAgeAtRegistration] = useState('');
 
   const [sexAtBirth, setSexAtBirth] =
     useState<
@@ -188,11 +187,7 @@ export default function NewPatientPage() {
               : {}),
           },
 
-          ...(dateOfBirth
-            ? {
-                dateOfBirth,
-              }
-            : {}),
+          ageAtRegistration: Number(ageAtRegistration),
 
           sexAtBirth,
 
@@ -364,17 +359,17 @@ export default function NewPatientPage() {
 
                 <label className="field">
                   <span>
-                    Date of birth
+                    Age
                   </span>
 
                   <input
-                    type="date"
-                    value={dateOfBirth}
-                    onChange={(event) =>
-                      setDateOfBirth(
-                        event.target.value,
-                      )
-                    }
+                    type="number"
+                    min="0"
+                    max="130"
+                    step="1"
+                    required
+                    value={ageAtRegistration}
+                    onChange={(event) => setAgeAtRegistration(event.target.value)}
                   />
                 </label>
 

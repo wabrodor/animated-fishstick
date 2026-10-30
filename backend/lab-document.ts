@@ -1,6 +1,6 @@
 import { enqueueOutboxEvent } from './outbox.js';
 import { LabDocument } from './models.js';
-import { hashLabPdf, saveLabPdf } from './storage.js';
+import { deleteLabPdf, hashLabPdf, saveLabPdf } from './storage.js';
 
 export type CreateLabDocumentInput = {
   clinicOrganizationId: string;
@@ -43,16 +43,19 @@ export async function createLabDocument(input: CreateLabDocumentInput) {
   }
 
   const stored = await saveLabPdf(input.buffer, input.clinicOrganizationId, input.patientId, sha256);
+  let document;
   try {
-    const document = await LabDocument.create({
+    document = await LabDocument.create({
       patientId: input.patientId,
       clinicOrganizationId: input.clinicOrganizationId,
       apexcareOrganizationId: input.apexcareOrganizationId,
       source: 'LAB_PDF',
       status: 'UPLOADED',
+      processingStage: 'QUEUED',
       fileName,
       mimeType: 'application/pdf',
       storageKey: stored.storageKey,
+      storageProvider: stored.storageProvider,
       sizeBytes: stored.sizeBytes,
       sha256: stored.sha256,
       idempotencyKey,
@@ -60,27 +63,45 @@ export async function createLabDocument(input: CreateLabDocumentInput) {
       uploadedAt: new Date(),
       extractionStatus: 'NOT_STARTED',
     });
-    await ensureLabDocumentOutbox(document.toObject());
-    return { document: document.toObject(), idempotent: false };
   } catch (error) {
-    if ((error as { code?: number })?.code !== 11000) throw error;
-    const recovered = await LabDocument.findOne({
-      clinicOrganizationId: input.clinicOrganizationId,
-      $or: [{ idempotencyKey }, { patientId: input.patientId, sha256 }],
-    }).lean();
-    if (!recovered) throw error;
-    if (recovered.idempotencyKey === idempotencyKey && (String(recovered.patientId) !== input.patientId || recovered.sha256 !== sha256)) {
-      const reuseError = new Error('Idempotency key was already used for a different lab document.');
-      (reuseError as Error & { code?: string }).code = 'IDEMPOTENCY_KEY_REUSE';
-      throw reuseError;
+    const duplicateKey = (error as { code?: number })?.code === 11000;
+    if (duplicateKey) {
+      const recovered = await LabDocument.findOne({
+        clinicOrganizationId: input.clinicOrganizationId,
+        $or: [{ idempotencyKey }, { patientId: input.patientId, sha256 }],
+      }).lean();
+      if (recovered) {
+        await cleanupStoredObject(stored.storageKey, stored.storageProvider);
+        if (recovered.idempotencyKey === idempotencyKey && (String(recovered.patientId) !== input.patientId || recovered.sha256 !== sha256)) {
+          const reuseError = new Error('Idempotency key was already used for a different lab document.');
+          (reuseError as Error & { code?: string }).code = 'IDEMPOTENCY_KEY_REUSE';
+          throw reuseError;
+        }
+        if (String(recovered.patientId) !== input.patientId || recovered.sha256 !== sha256) throw error;
+        await ensureLabDocumentOutbox(recovered);
+        return { document: recovered, idempotent: true };
+      }
     }
-    if (String(recovered.patientId) !== input.patientId || recovered.sha256 !== sha256) throw error;
-    await ensureLabDocumentOutbox(recovered);
-    return { document: recovered, idempotent: true };
+    await cleanupStoredObject(stored.storageKey, stored.storageProvider);
+    throw error;
+  }
+
+  // Keep the object if outbox persistence fails: MongoDB already owns the source record,
+  // and a retry/reconciliation may safely publish the event later.
+  await ensureLabDocumentOutbox(document.toObject());
+  return { document: document.toObject(), idempotent: false };
+}
+
+async function cleanupStoredObject(storageKey: string, storageProvider: 'local' | 's3') {
+  try {
+    await deleteLabPdf(storageKey, storageProvider);
+  } catch (error) {
+    const code = (error as { code?: string })?.code;
+    console.error('Medical document orphan cleanup failed', { errorCode: typeof code === 'string' ? code : 'STORAGE_DELETE_FAILED' });
   }
 }
 
-async function ensureLabDocumentOutbox(document: { _id: unknown; clinicOrganizationId: unknown; patientId: unknown; apexcareOrganizationId: unknown; fileName: string; sha256: string; storageKey: string }) {
+async function ensureLabDocumentOutbox(document: { _id: unknown; clinicOrganizationId: unknown; patientId: unknown; apexcareOrganizationId: unknown; processingVersion?: number }) {
   const organizationId = String(document.clinicOrganizationId);
   const documentId = String(document._id);
   await enqueueOutboxEvent({
@@ -94,9 +115,7 @@ async function ensureLabDocumentOutbox(document: { _id: unknown; clinicOrganizat
       patientId: String(document.patientId),
       clinicOrganizationId: organizationId,
       apexcareOrganizationId: String(document.apexcareOrganizationId),
-      fileName: document.fileName,
-      sha256: document.sha256,
-      storageKey: document.storageKey,
+      processingVersion: document.processingVersion ?? 1,
     },
   });
 }

@@ -36,284 +36,6 @@ const userSchema = new Schema({
 // when the same email exists in multiple clinics.
 userSchema.index({ email: 1 }, { unique: true });
 
-// General medical-history intake is completed by the ApexCare Coordinator,
-// who is the doctor responsible for collecting this history in this workflow.
-// Keep the single actor reference (`collectedByUserId`) rather than modelling
-// the coordinator and doctor as separate people. Existing application RBAC role
-// values are intentionally unchanged here; renaming roles requires a broader
-// routes/permissions/data migration audit.
-const HISTORY_ANSWER_VALUES = [
-  'YES',
-  'NO',
-  'UNKNOWN',
-  'NOT_ASKED',
-  'DECLINED',
-] as const;
-
-const HISTORY_SOURCE_VALUES = [
-  'PATIENT_REPORTED',
-  'CAREGIVER_REPORTED',
-  'PRIOR_MEDICAL_RECORD',
-  'EXTERNAL_DOCUMENT',
-  'CLINICIAN_ASSESSED',
-  'MIXED',
-  'UNKNOWN',
-] as const;
-
-const medicalHistorySymptomSchema = new Schema({
-  name: { type: String, required: true, trim: true, maxlength: 120 },
-  description: { type: String, trim: true, maxlength: 2000 },
-  bodySite: { type: String, trim: true, maxlength: 120 },
-  onsetType: { type: String, enum: ['SUDDEN', 'GRADUAL', 'UNKNOWN'] },
-  onsetDate: Date,
-  onsetDateApproximate: { type: Boolean, default: false },
-  durationValue: { type: Number, min: 0 },
-  durationUnit: {
-    type: String,
-    enum: ['HOURS', 'DAYS', 'WEEKS', 'MONTHS', 'YEARS'],
-  },
-  frequency: {
-    type: String,
-    enum: ['CONTINUOUS', 'INTERMITTENT', 'EPISODIC', 'OCCASIONAL', 'UNKNOWN'],
-  },
-  frequencyDetails: { type: String, trim: true, maxlength: 500 },
-  severity: { type: String, enum: ['MILD', 'MODERATE', 'SEVERE', 'UNKNOWN'] },
-  progression: {
-    type: String,
-    enum: ['IMPROVING', 'UNCHANGED', 'WORSENING', 'FLUCTUATING', 'UNKNOWN'],
-  },
-  associatedSymptoms: { type: [String], default: [] },
-  aggravatingFactors: { type: [String], default: [] },
-  relievingFactors: { type: [String], default: [] },
-  previousTreatment: { type: String, trim: true, maxlength: 2000 },
-  dailyActivityImpact: { type: String, trim: true, maxlength: 1000 },
-  source: { type: String, enum: HISTORY_SOURCE_VALUES, default: 'UNKNOWN' },
-  notes: { type: String, trim: true, maxlength: 2000 },
-});
-
-const medicalHistorySystemReviewSchema = new Schema({
-  system: {
-    type: String,
-    enum: [
-      'GENERAL',
-      'CARDIOVASCULAR',
-      'RESPIRATORY',
-      'GASTROINTESTINAL',
-      'GENITOURINARY',
-      'NEUROLOGICAL',
-      'MUSCULOSKELETAL',
-      'SKIN',
-      'ENDOCRINE',
-      'EYES',
-      'ENT',
-      'HEMATOLOGICAL',
-      'PSYCHIATRIC',
-      'OTHER',
-    ],
-    required: true,
-  },
-  answer: { type: String, enum: HISTORY_ANSWER_VALUES, required: true, default: 'NOT_ASKED' },
-  findings: { type: [String], default: [] },
-  notes: { type: String, trim: true, maxlength: 1000 },
-  source: { type: String, enum: HISTORY_SOURCE_VALUES, default: 'UNKNOWN' },
-}, { _id: false });
-
-const medicalHistoryConditionSchema = new Schema({
-  name: { type: String, required: true, trim: true, maxlength: 150 },
-  status: {
-    type: String,
-    enum: ['CURRENT', 'RESOLVED', 'IN_REMISSION', 'UNKNOWN'],
-    default: 'UNKNOWN',
-  },
-  diagnosedAt: Date,
-  diagnosisDateApproximate: { type: Boolean, default: false },
-  complications: { type: [String], default: [] },
-  treatmentHistory: { type: String, trim: true, maxlength: 2000 },
-  source: { type: String, enum: HISTORY_SOURCE_VALUES, default: 'UNKNOWN' },
-  notes: { type: String, trim: true, maxlength: 1000 },
-});
-
-const medicalHistorySurgerySchema = new Schema({
-  procedure: { type: String, required: true, trim: true, maxlength: 200 },
-  date: Date,
-  dateApproximate: { type: Boolean, default: false },
-  reason: { type: String, trim: true, maxlength: 500 },
-  notes: { type: String, trim: true, maxlength: 1000 },
-});
-
-const medicalHistoryHospitalizationSchema = new Schema({
-  reason: { type: String, required: true, trim: true, maxlength: 200 },
-  admissionDate: Date,
-  dischargeDate: Date,
-  notes: { type: String, trim: true, maxlength: 1000 },
-});
-
-const medicalHistoryInfectionSchema = new Schema({
-  name: { type: String, required: true, trim: true, maxlength: 150 },
-  date: Date,
-  dateApproximate: { type: Boolean, default: false },
-  outcome: { type: String, trim: true, maxlength: 500 },
-});
-
-const medicalHistoryFamilyConditionSchema = new Schema({
-  condition: { type: String, required: true, trim: true, maxlength: 150 },
-  relationship: { type: String, trim: true, maxlength: 80 },
-  ageAtDiagnosis: { type: Number, min: 0, max: 120 },
-  notes: { type: String, trim: true, maxlength: 500 },
-});
-
-const medicalHistoryInvestigationSchema = new Schema({
-  testName: { type: String, required: true, trim: true, maxlength: 150 },
-  performedAt: Date,
-  resultSummary: { type: String, trim: true, maxlength: 1000 },
-  unit: { type: String, trim: true, maxlength: 50 },
-  source: { type: String, enum: HISTORY_SOURCE_VALUES, default: 'UNKNOWN' },
-  // Link to an existing structured result when one is available; do not duplicate it.
-  labResultId: { type: Schema.Types.ObjectId, ref: 'LabResult' },
-});
-
-const medicalHistorySchema = new Schema({
-  presentingComplaints: {
-    responseStatus: {
-      type: String,
-      enum: HISTORY_ANSWER_VALUES,
-      default: 'NOT_ASKED',
-    },
-    reasonForAssessment: { type: String, trim: true, maxlength: 1000 },
-    symptoms: { type: [medicalHistorySymptomSchema], default: [] },
-    relevantNegativeSymptoms: { type: [String], default: [] },
-    notes: { type: String, trim: true, maxlength: 2000 },
-  },
-
-  // Complaint-driven in the UI. The API should prevent duplicate system entries
-  // and validate symptom details conditionally based on the recorded answers.
-  reviewOfSystems: { type: [medicalHistorySystemReviewSchema], default: [] },
-
-  pastMedicalHistory: {
-    previousConditionsPresent: {
-      type: String,
-      enum: HISTORY_ANSWER_VALUES,
-      default: 'NOT_ASKED',
-    },
-    conditions: { type: [medicalHistoryConditionSchema], default: [] },
-    previousSurgeryPresent: {
-      type: String,
-      enum: HISTORY_ANSWER_VALUES,
-      default: 'NOT_ASKED',
-    },
-    surgeries: { type: [medicalHistorySurgerySchema], default: [] },
-    previousHospitalizationPresent: {
-      type: String,
-      enum: HISTORY_ANSWER_VALUES,
-      default: 'NOT_ASKED',
-    },
-    hospitalizations: { type: [medicalHistoryHospitalizationSchema], default: [] },
-    significantInfectionPresent: {
-      type: String,
-      enum: HISTORY_ANSWER_VALUES,
-      default: 'NOT_ASKED',
-    },
-    significantInfections: { type: [medicalHistoryInfectionSchema], default: [] },
-    additionalHistory: { type: String, trim: true, maxlength: 3000 },
-  },
-
-  allergies: {
-    answer: {
-      type: String,
-      enum: ['YES', 'NO_KNOWN_ALLERGIES', 'UNKNOWN', 'NOT_ASKED', 'DECLINED'],
-      default: 'NOT_ASKED',
-    },
-    items: {
-      type: [{
-        substance: { type: String, required: true, trim: true, maxlength: 200 },
-        reactionType: { type: String, enum: ['ALLERGY', 'INTOLERANCE', 'UNKNOWN'], default: 'UNKNOWN' },
-        reaction: { type: String, trim: true, maxlength: 500 },
-        severity: { type: String, enum: ['MILD', 'MODERATE', 'SEVERE', 'UNKNOWN'], default: 'UNKNOWN' },
-        source: { type: String, enum: HISTORY_SOURCE_VALUES, default: 'UNKNOWN' },
-      }],
-      default: [],
-    },
-    notes: { type: String, trim: true, maxlength: 1000 },
-  },
-
-  familyHistory: {
-    answer: { type: String, enum: HISTORY_ANSWER_VALUES, default: 'NOT_ASKED' },
-    conditions: { type: [medicalHistoryFamilyConditionSchema], default: [] },
-    notes: { type: String, trim: true, maxlength: 1000 },
-  },
-
-  socialHistory: {
-    tobaccoUse: {
-      answer: { type: String, enum: HISTORY_ANSWER_VALUES, default: 'NOT_ASKED' },
-      status: { type: String, enum: ['NEVER', 'FORMER', 'CURRENT', 'UNKNOWN'] },
-      product: { type: String, trim: true, maxlength: 150 },
-      quantityAndFrequency: { type: String, trim: true, maxlength: 300 },
-      duration: { type: String, trim: true, maxlength: 150 },
-      quitAt: Date,
-    },
-    alcoholUse: {
-      answer: { type: String, enum: HISTORY_ANSWER_VALUES, default: 'NOT_ASKED' },
-      status: { type: String, enum: ['NEVER', 'FORMER', 'CURRENT', 'UNKNOWN'] },
-      frequencyAndQuantity: { type: String, trim: true, maxlength: 300 },
-    },
-    dietPattern: { type: String, trim: true, maxlength: 1500 },
-    saltIntake: { type: String, enum: ['LOW', 'MODERATE', 'HIGH', 'UNKNOWN'] },
-    physicalActivity: { type: String, trim: true, maxlength: 1000 },
-    sleepProblemsPresent: { type: String, enum: HISTORY_ANSWER_VALUES, default: 'NOT_ASKED' },
-    sleepDetails: { type: String, trim: true, maxlength: 1000 },
-    occupation: { type: String, trim: true, maxlength: 200 },
-    livingSituation: { type: String, trim: true, maxlength: 500 },
-    supportSystem: { type: String, trim: true, maxlength: 500 },
-    barriersToCare: { type: [String], default: [] },
-    additionalNotes: { type: String, trim: true, maxlength: 2000 },
-  },
-
-  reproductiveHistory: {
-    applicability: {
-      type: String,
-      enum: ['APPLICABLE', 'NOT_APPLICABLE', 'NOT_ASKED', 'DECLINED'],
-      default: 'NOT_ASKED',
-    },
-    menstrualHistory: { type: String, trim: true, maxlength: 1000 },
-    lastMenstrualPeriod: Date,
-    pregnancyStatus: {
-      type: String,
-      enum: ['PREGNANT', 'NOT_PREGNANT', 'POSSIBLE', 'UNKNOWN', 'NOT_APPLICABLE'],
-    },
-    obstetricHistory: { type: String, trim: true, maxlength: 2000 },
-    menopauseStatus: {
-      type: String,
-      enum: ['PREMENOPAUSAL', 'PERIMENOPAUSAL', 'POSTMENOPAUSAL', 'NOT_APPLICABLE', 'UNKNOWN'],
-    },
-    additionalNotes: { type: String, trim: true, maxlength: 1000 },
-  },
-
-  // Historical summaries only; current and repeated results remain in LabResult/VitalRecord.
-  previousInvestigations: { type: [medicalHistoryInvestigationSchema], default: [] },
-  additionalNotes: { type: String, trim: true, maxlength: 5000 },
-
-  intakeMetadata: {
-    status: {
-      type: String,
-      enum: ['IN_PROGRESS', 'COMPLETED', 'NEEDS_CLARIFICATION'],
-      default: 'IN_PROGRESS',
-    },
-    collectedAt: Date,
-    // This is the ApexCare Coordinator/doctor collecting the baseline history.
-    // The same user may complete the intake and clinical assessment; no separate
-    // coordinator-versus-doctor identity is stored in this section.
-    collectedByUserId: { type: Schema.Types.ObjectId, ref: 'User' },
-    completedAt: Date,
-    informationSources: { type: [String], enum: HISTORY_SOURCE_VALUES, default: [] },
-    patientConfirmation: {
-      type: String,
-      enum: ['CONFIRMED', 'NOT_CONFIRMED', 'DECLINED', 'NOT_APPLICABLE'],
-      default: 'NOT_CONFIRMED',
-    },
-    amendmentReason: { type: String, trim: true, maxlength: 2000 },
-  },
-}, { timestamps: true, _id: false });
-
 const patientSchema = new Schema({
   organizationId: { type: Schema.Types.ObjectId, ref: 'Organization', required: true, index: true },
   medicalRecordNumber: { type: String, required: true, trim: true, maxlength: 64 },
@@ -322,16 +44,12 @@ const patientSchema = new Schema({
     last: { type: String, trim: true, maxlength: 80 },
   },
   dateOfBirth: { type: Date },
+  ageAtRegistration: { type: Number, min: 0, max: 130 },
   sexAtBirth: { type: String, enum: ['FEMALE', 'MALE', 'INTERSEX', 'NOT_RECORDED'] },
   phone: { type: String, trim: true, maxlength: 25 },
   whatsapp: { type: String, trim: true, maxlength: 25 },
   preferredLanguage: { type: String, default: 'en', trim: true, maxlength: 20 },
   preferredContactChannel: { type: String, enum: ['PHONE', 'SMS', 'WHATSAPP', 'APP'], default: 'PHONE' },
-    contactProfileLastUpdatedAt: { type: Date },
-  contactProfileLastUpdatedByUserId: {
-    type: Schema.Types.ObjectId,
-    ref: 'User',
-  },
   assignedClinicianId: { type: Schema.Types.ObjectId, ref: 'User', required: true, index: true },
   enrolledByUserId: { type: Schema.Types.ObjectId, ref: 'User' },
   enrollmentStatus: { type: String, enum: ['NOT_ENROLLED', 'ENROLLED', 'CARE_PLAN_REVIEW', 'ACTIVE_CARE', 'INACTIVE'], default: 'NOT_ENROLLED', index: true },
@@ -340,8 +58,6 @@ const patientSchema = new Schema({
     status: { type: String, enum: ['SUSPECTED', 'CONFIRMED', 'CONTROLLED', 'INACTIVE'], required: true },
     diagnosedAt: Date,
   }],
-  // Comprehensive baseline intake; intentionally excludes medication history.
-  medicalHistory: { type: medicalHistorySchema, default: undefined },
   programmeConsent: {
     acceptedAt: { type: Date },
     acceptedByUserId: { type: Schema.Types.ObjectId, ref: 'User' },
@@ -352,24 +68,7 @@ const patientSchema = new Schema({
 patientSchema.index({ organizationId: 1, medicalRecordNumber: 1 }, { unique: true });
 patientSchema.index({ organizationId: 1, phone: 1 });
 
-// Append a revision snapshot whenever medicalHistory is first completed or amended.
-// This model alone does not create revisions automatically; the service layer must
-// persist a validated snapshot in the same transaction as the Patient update.
-const patientMedicalHistoryRevisionSchema = new Schema({
-  organizationId: { type: Schema.Types.ObjectId, ref: 'Organization', required: true, index: true },
-  patientId: { type: Schema.Types.ObjectId, ref: 'Patient', required: true, index: true },
-  version: { type: Number, required: true, min: 1 },
-  changeType: { type: String, enum: ['INITIAL_INTAKE', 'AMENDMENT'], required: true },
-  snapshot: { type: Schema.Types.Mixed, required: true, immutable: true },
-  reason: { type: String, trim: true, maxlength: 2000 },
-  changedByUserId: { type: Schema.Types.ObjectId, ref: 'User', required: true },
-  changedAt: { type: Date, required: true, default: Date.now },
-}, { timestamps: true });
-patientMedicalHistoryRevisionSchema.index(
-  { organizationId: 1, patientId: 1, version: 1 },
-  { unique: true },
-);
-patientMedicalHistoryRevisionSchema.index({ organizationId: 1, patientId: 1, changedAt: -1 });
+
 
 const patientClinicRelationshipSchema = new Schema({
   patientId: { type: Schema.Types.ObjectId, ref: 'Patient', required: true, index: true },
@@ -385,6 +84,51 @@ patientClinicRelationshipSchema.index(
   { unique: true, partialFilterExpression: { status: 'ACTIVE' } },
 );
 
+const apexCareGeneralHistoryAnswerSchema = new Schema({
+  questionId: { type: String, required: true, trim: true, maxlength: 80 },
+  section: { type: String, enum: ['PAST_MEDICAL', 'FAMILY', 'SOCIAL', 'ALLERGIES', 'REPRODUCTIVE', 'PRIOR_INVESTIGATIONS'], required: true },
+  question: { type: String, required: true, trim: true, maxlength: 300 },
+  answer: { type: String, enum: ['YES', 'NO', 'UNKNOWN', 'DECLINED'], required: true },
+  details: { type: String, trim: true, maxlength: 2000 },
+}, { _id: false });
+
+const apexCareGeneralHistoryEventSchema = new Schema({
+  // New writes are coordinator collection events. Older review event values
+  // remain accepted so legacy records can still be read and safely migrated.
+  eventType: { type: String, enum: ['DRAFT_SAVED', 'RECORDED', 'SUBMITTED', 'RETURNED_FOR_CLARIFICATION', 'APPROVED'], required: true },
+  actorUserId: { type: Schema.Types.ObjectId, ref: 'User', required: true },
+  actorRole: { type: String, enum: ['APEXCARE_COORDINATOR', 'APEXCARE_DOCTOR'], required: true },
+  notes: { type: String, trim: true, maxlength: 3000 },
+  createdAt: { type: Date, required: true, default: Date.now },
+}, { _id: false });
+
+const apexCareGeneralHistorySchema = new Schema({
+  enrollmentId: { type: Schema.Types.ObjectId, ref: 'ApexCareEnrollment', required: true, unique: true, index: true },
+  patientId: { type: Schema.Types.ObjectId, ref: 'Patient', required: true, index: true },
+  clinicOrganizationId: { type: Schema.Types.ObjectId, ref: 'Organization', required: true, index: true },
+  apexcareOrganizationId: { type: Schema.Types.ObjectId, ref: 'Organization', required: true, index: true },
+  // New records move from IN_PROGRESS to RECORDED. Legacy review states
+  // remain in the enum only so existing documents can be read during migration.
+  status: { type: String, enum: ['NOT_STARTED', 'IN_PROGRESS', 'RECORDED', 'PENDING_REVIEW', 'COMPLETED', 'DECLINED'], required: true, default: 'IN_PROGRESS', index: true },
+  questionnaireVersion: { type: String, required: true, trim: true, maxlength: 40 },
+  answers: { type: [apexCareGeneralHistoryAnswerSchema], default: [] },
+  notes: { type: String, trim: true, maxlength: 3000 },
+  collectedByUserId: { type: Schema.Types.ObjectId, ref: 'User', required: true },
+  lastUpdatedByUserId: { type: Schema.Types.ObjectId, ref: 'User', required: true },
+  collectedAt: { type: Date, required: true, default: Date.now },
+  recordedAt: { type: Date },
+  events: { type: [apexCareGeneralHistoryEventSchema], default: [] },
+  // Legacy clinician-review fields are retained for historical document compatibility.
+  // No active route or UI writes review decisions to these fields.
+  submittedAt: { type: Date },
+  reviewedByUserId: { type: Schema.Types.ObjectId, ref: 'User' },
+  reviewedAt: { type: Date },
+  reviewNotes: { type: String, trim: true, maxlength: 3000 },
+  reviewEvents: { type: [apexCareGeneralHistoryEventSchema], default: [] },
+}, { timestamps: true, optimisticConcurrency: true });
+apexCareGeneralHistorySchema.index({ apexcareOrganizationId: 1, status: 1, recordedAt: 1 });
+apexCareGeneralHistorySchema.index({ clinicOrganizationId: 1, patientId: 1, createdAt: -1 });
+
 const apexCareEnrollmentSchema = new Schema({
   patientId: { type: Schema.Types.ObjectId, ref: 'Patient', required: true, index: true },
   clinicOrganizationId: { type: Schema.Types.ObjectId, ref: 'Organization', required: true, index: true },
@@ -396,6 +140,13 @@ const apexCareEnrollmentSchema = new Schema({
   coordinatorCallDueAt: { type: Date, index: true },
   coordinatorCallStatus: { type: String, enum: ['PENDING', 'CONTACTED', 'NO_ANSWER', 'ESCALATED'], default: 'PENDING', index: true },
   coordinatorCalledAt: { type: Date },
+  generalHistoryId: { type: Schema.Types.ObjectId, ref: 'ApexCareGeneralHistory' },
+  // Legacy review statuses remain accepted for existing enrollment documents;
+  // new workflow writes use NOT_STARTED, IN_PROGRESS and RECORDED only.
+  generalHistoryStatus: { type: String, enum: ['NOT_STARTED', 'IN_PROGRESS', 'RECORDED', 'PENDING_REVIEW', 'COMPLETED', 'DECLINED'], default: 'NOT_STARTED', index: true },
+  generalHistoryUpdatedAt: { type: Date },
+  generalHistoryRecordedAt: { type: Date },
+  generalHistoryCompletedAt: { type: Date }, // legacy field; no longer written
   dietitianAssessmentStatus: { type: String, enum: ['PENDING', 'COMPLETED'], default: 'PENDING', index: true },
   carePlanDraftId: { type: Schema.Types.ObjectId, ref: 'CarePlanDraft' },
   carePlanGenerationStatus: { type: String, enum: ['NOT_STARTED', 'QUEUED', 'PROCESSING', 'COMPLETED', 'FAILED'], default: 'NOT_STARTED', index: true },
@@ -431,6 +182,13 @@ apexCareReferralSchema.index(
   { unique: true, partialFilterExpression: { status: 'PENDING_STAFF' } },
 );
 
+const medicalDocumentOcrLineSchema = new Schema({
+  text: { type: String, trim: true, maxlength: 1000, required: true },
+  confidence: { type: Number, min: 0, max: 1 },
+  page: { type: Number, min: 1 },
+  boundingBox: { type: [[Number]], default: undefined },
+}, { _id: false });
+
 const prescriptionDocumentSchema = new Schema({
   patientId: { type: Schema.Types.ObjectId, ref: 'Patient', required: true, index: true },
   clinicOrganizationId: { type: Schema.Types.ObjectId, ref: 'Organization', required: true, index: true },
@@ -440,10 +198,25 @@ const prescriptionDocumentSchema = new Schema({
   fileName: { type: String, trim: true, maxlength: 255, required: true },
   mimeType: { type: String, trim: true, maxlength: 100, required: true },
   storageKey: { type: String, trim: true, maxlength: 500, required: true },
+  storageProvider: { type: String, enum: ['local', 's3'] },
   originalFileName: { type: String, trim: true, maxlength: 255 },
   sizeBytes: { type: Number, min: 1 },
   sha256: { type: String, trim: true, match: /^[a-f0-9]{64}$/i },
   analysisStatus: { type: String, enum: ['NOT_STARTED', 'PENDING', 'COMPLETED', 'FAILED'], default: 'NOT_STARTED', index: true },
+  ocrLines: { type: [medicalDocumentOcrLineSchema], default: [], validate: [(lines: unknown[]) => lines.length <= 1000, 'Too many OCR lines.'] },
+  ocrFullText: { type: String, trim: true, maxlength: 20000 },
+  ocrEngine: { type: String, enum: ['PADDLEOCR', 'LOCAL_PDF_TEXT'] },
+  ocrEngineVersion: { type: String, trim: true, maxlength: 40 },
+  ocrProcessedAt: { type: Date },
+  ocrWarningCode: { type: String, trim: true, maxlength: 100 },
+  processingVersion: { type: Number, min: 1, default: 1 },
+  processingStage: { type: String, enum: ['QUEUED', 'OCR', 'AI_EXTRACTION', 'FINALIZE', 'COMPLETED', 'FAILED'], index: true },
+  processingAttempts: { type: Number, min: 0, default: 0 },
+  safeLastErrorCode: { type: String, trim: true, maxlength: 100 },
+  structuringProvider: { type: String, enum: ['DEEPSEEK'] },
+  structuringModel: { type: String, trim: true, maxlength: 120 },
+  structuringPromptVersion: { type: String, trim: true, maxlength: 40 },
+  structuringSchemaVersion: { type: String, trim: true, maxlength: 40 },
   clinicalReviewReason: { type: String, trim: true, maxlength: 1000 },
   capturedByUserId: { type: Schema.Types.ObjectId, ref: 'User', required: true },
   capturedAt: { type: Date, required: true, default: Date.now },
@@ -466,15 +239,30 @@ const labDocumentSchema = new Schema({
   storageKey: { type: String, trim: true, maxlength: 500, required: true },
   sizeBytes: { type: Number, min: 1, required: true },
   sha256: { type: String, trim: true, match: /^[a-f0-9]{64}$/i, required: true },
+  storageProvider: { type: String, enum: ['local', 's3'] },
   idempotencyKey: { type: String, trim: true, maxlength: 300, required: true },
   uploadedByUserId: { type: Schema.Types.ObjectId, ref: 'User', required: true },
   uploadedAt: { type: Date, required: true, default: Date.now },
   extractionStatus: { type: String, enum: ['NOT_STARTED', 'QUEUED', 'PROCESSING', 'COMPLETED', 'FAILED'], default: 'NOT_STARTED', index: true },
+  extractionWarningCode: { type: String, trim: true, maxlength: 100 },
+  ocrLines: { type: [medicalDocumentOcrLineSchema], default: [], validate: [(lines: unknown[]) => lines.length <= 1000, 'Too many OCR lines.'] },
+  ocrEngine: { type: String, enum: ['PADDLEOCR', 'LOCAL_PDF_TEXT'] },
+  ocrEngineVersion: { type: String, trim: true, maxlength: 40 },
+  ocrProcessedAt: { type: Date },
+  ocrWarningCode: { type: String, trim: true, maxlength: 100 },
+  processingVersion: { type: Number, min: 1, default: 1 },
+  processingStage: { type: String, enum: ['QUEUED', 'OCR', 'AI_EXTRACTION', 'FINALIZE', 'COMPLETED', 'FAILED'], index: true },
+  processingAttempts: { type: Number, min: 0, default: 0 },
+  safeLastErrorCode: { type: String, trim: true, maxlength: 100 },
   extractionError: { type: String, trim: true, maxlength: 1000 },
   extractionStartedAt: { type: Date },
   extractedText: { type: String, trim: true, maxlength: 100000 },
   extractionVersion: { type: Number, min: 1 },
   structuringStatus: { type: String, enum: ['NOT_STARTED', 'PROCESSING', 'COMPLETED', 'FAILED'], default: 'NOT_STARTED', index: true },
+  structuringProvider: { type: String, enum: ['DEEPSEEK', 'DETERMINISTIC_RULES'] },
+  structuringModel: { type: String, trim: true, maxlength: 120 },
+  structuringPromptVersion: { type: String, trim: true, maxlength: 40 },
+  structuringSchemaVersion: { type: String, trim: true, maxlength: 40 },
   structuringError: { type: String, trim: true, maxlength: 1000 },
   structuringStartedAt: { type: Date },
   structuringVersion: { type: Number, min: 1 },
@@ -489,6 +277,7 @@ const labDocumentSchema = new Schema({
 labDocumentSchema.index({ clinicOrganizationId: 1, patientId: 1, sha256: 1 }, { unique: true });
 labDocumentSchema.index({ clinicOrganizationId: 1, idempotencyKey: 1 }, { unique: true });
 labDocumentSchema.index({ clinicOrganizationId: 1, patientId: 1, createdAt: -1 });
+labDocumentSchema.index({ clinicOrganizationId: 1, 'processingStage': 1, uploadedAt: 1 });
 labDocumentSchema.index({ apexcareOrganizationId: 1, patientId: 1, createdAt: -1 });
 
 const labInterpretationSchema = new Schema({
@@ -533,7 +322,11 @@ const labResultSchema = new Schema({
   abnormalFlag: { type: String, enum: ['HIGH', 'LOW', 'NORMAL', 'UNKNOWN'], required: true },
   specimen: { type: String, trim: true, maxlength: 120 },
   sourceText: { type: String, required: true, trim: true, maxlength: 1000 },
+  sourcePage: { type: Number, min: 1 },
   extractionConfidence: { type: Number, min: 0, max: 1, required: true },
+  extractionMethod: { type: String, enum: ['DEEPSEEK', 'DETERMINISTIC_RULES'] },
+  extractionModel: { type: String, trim: true, maxlength: 120 },
+  reviewStatus: { type: String, enum: ['UNVERIFIED', 'VERIFIED', 'SUPERSEDED'], default: 'UNVERIFIED', index: true },
   parserVersion: { type: Number, required: true, min: 1 },
   resultKey: { type: String, required: true, trim: true, maxlength: 300 },
 }, { timestamps: true });
@@ -876,7 +669,7 @@ const patientReviewQuestionSchema = new Schema(
     questionId: { type: String, required: true, trim: true, maxlength: 80 },
     topic: {
       type: String,
-      enum: ['MEDICATION_ADHERENCE', 'DIET_ADHERENCE', 'LIFESTYLE_ADHERENCE', 'LABS', 'SYMPTOMS', 'CARE_PLAN', 'PATIENT_CONCERNS', 'HOME_BP', 'LIFESTYLE', 'FOLLOW_UP'],
+      enum: ['MEDICATION_ADHERENCE', 'DIET_ADHERENCE', 'LIFESTYLE_ADHERENCE', 'LABS', 'SYMPTOMS', 'CARE_PLAN', 'PATIENT_CONCERNS'],
       required: true,
     },
     question: { type: String, required: true, trim: true, maxlength: 300 },
@@ -947,9 +740,6 @@ const patientReviewSchema = new Schema(
     lastContactedByUserId: { type: Schema.Types.ObjectId, ref: 'User' },
     contactNotes: { type: String, trim: true, maxlength: 1000 },
     questions: { type: [patientReviewQuestionSchema], default: [] },
-    // Persist submitted answers separately from the template questions. Without this
-    // path, Mongoose strict mode can silently omit the coordinator's collected answers.
-    answers: { type: [patientReviewQuestionSchema], default: [] },
     vitalsRecordId: { type: Schema.Types.ObjectId, ref: 'VitalRecord' },
     notes: { type: String, trim: true, maxlength: 3000 },
     adherenceSnapshot: { type: patientReviewAdherenceSnapshotSchema },
@@ -1200,12 +990,11 @@ const opdVisitSchema = new Schema({
 opdVisitSchema.index({ organizationId: 1, patientId: 1, visitAt: -1 });
 
 export type UserDocument = InferSchemaType<typeof userSchema> & { _id: mongoose.Types.ObjectId };
-export type PatientDocument = InferSchemaType<typeof patientSchema> & { _id: mongoose.Types.ObjectId };
 export const Organization = mongoose.model('Organization', organizationSchema);
 export const User = mongoose.model('User', userSchema);
 export const Patient = mongoose.model('Patient', patientSchema);
-export const PatientMedicalHistoryRevision = mongoose.model('PatientMedicalHistoryRevision', patientMedicalHistoryRevisionSchema);
 export const PatientClinicRelationship = mongoose.model('PatientClinicRelationship', patientClinicRelationshipSchema);
+export const ApexCareGeneralHistory = mongoose.model('ApexCareGeneralHistory', apexCareGeneralHistorySchema);
 export const ApexCareEnrollment = mongoose.model('ApexCareEnrollment', apexCareEnrollmentSchema);
 export const ApexCareReferral = mongoose.model('ApexCareReferral', apexCareReferralSchema);
 export const PrescriptionDocument = mongoose.model('PrescriptionDocument', prescriptionDocumentSchema);

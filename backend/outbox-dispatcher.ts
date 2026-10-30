@@ -37,13 +37,14 @@ export async function dispatchOutboxEvent(event: { eventType: string; payload: R
       organizationId: String(payload.clinicOrganizationId),
       patientId: String(payload.patientId),
       apexcareOrganizationId: String(payload.apexcareOrganizationId),
+      processingVersion: Number(payload.processingVersion ?? 1),
     });
   }
 
   if (event.eventType === 'LAB_DOCUMENT_EXTRACTED') {
     const payload = event.payload;
     const documentId = String(payload.documentId);
-    const document = await LabDocument.findOne({ _id: documentId, clinicOrganizationId: String(payload.clinicOrganizationId), patientId: String(payload.patientId), extractionStatus: 'COMPLETED' }).select('structuringStatus').lean();
+    const document = await LabDocument.findOne({ _id: documentId, clinicOrganizationId: String(payload.clinicOrganizationId), patientId: String(payload.patientId), extractionStatus: 'COMPLETED' }).select('structuringStatus processingVersion').lean();
     if (!document) throw new Error('LAB_DOCUMENT_NOT_READY_FOR_STRUCTURING');
     if (document.structuringStatus === 'COMPLETED') return documentId;
     return scheduleLabResultStructuring({
@@ -51,13 +52,15 @@ export async function dispatchOutboxEvent(event: { eventType: string; payload: R
       organizationId: String(payload.clinicOrganizationId),
       patientId: String(payload.patientId),
       apexcareOrganizationId: String(payload.apexcareOrganizationId),
+      processingVersion: Number(payload.processingVersion ?? document.processingVersion ?? 1),
     });
   }
 
   if (event.eventType === 'LAB_RESULTS_STRUCTURED') {
     const payload = event.payload;
     const documentId = String(payload.documentId);
-    const document = await LabDocument.findOne({ _id: documentId, clinicOrganizationId: String(payload.clinicOrganizationId), patientId: String(payload.patientId), extractionStatus: 'COMPLETED', structuringStatus: 'COMPLETED' }).select('interpretationStatus').lean();
+    const processingVersion = Number(payload.processingVersion ?? 1);
+    const document = await LabDocument.findOne({ _id: documentId, clinicOrganizationId: String(payload.clinicOrganizationId), patientId: String(payload.patientId), ...(processingVersion === 1 ? { $or: [{ processingVersion: 1 }, { processingVersion: { $exists: false } }] } : { processingVersion }), extractionStatus: 'COMPLETED', structuringStatus: 'COMPLETED' }).select('interpretationStatus').lean();
     if (!document) throw new Error('LAB_DOCUMENT_NOT_READY_FOR_INTERPRETATION');
     if (document.interpretationStatus === 'COMPLETED') return documentId;
     return scheduleLabInterpretation({
@@ -65,6 +68,7 @@ export async function dispatchOutboxEvent(event: { eventType: string; payload: R
       organizationId: String(payload.clinicOrganizationId),
       patientId: String(payload.patientId),
       apexcareOrganizationId: String(payload.apexcareOrganizationId),
+      processingVersion,
     });
   }
 

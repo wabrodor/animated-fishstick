@@ -58,18 +58,40 @@ function ApexHome() {
   const load = useCallback(async (refresh = false) => {
     if (refresh) setRefreshing(true);
     setError(null);
-    const results = await Promise.allSettled([
-      apexCoordinatorQueue(),
-      apexReferrals(),
-      apexServiceCases(),
-    ]);
-    const [queueResult, referralResult, caseResult] = results;
-    if (queueResult.status === 'fulfilled') setCoordinator(queueResult.value);
-    if (referralResult.status === 'fulfilled') setReferrals(referralResult.value);
-    if (caseResult.status === 'fulfilled') setCases(caseResult.value);
-    const failedCount = results.filter((result) => result.status === 'rejected').length;
-    if (failedCount === results.length) {
-      setError('Unable to load ApexCare operations. Check your connection and try again.');
+    let currentRole: string | null = null;
+    try {
+      currentRole = JSON.parse(localStorage.getItem('apexcare_user') || '{}').roles?.[0] || null;
+    } catch {
+      currentRole = null;
+    }
+
+    let failedCount = 0;
+    let totalRequests = 0;
+
+    if (currentRole === 'APEXCARE_COORDINATOR') {
+      const [queueResult, referralResult, caseResult] = await Promise.allSettled([
+        apexCoordinatorQueue(),
+        apexReferrals(),
+        apexServiceCases(),
+      ]);
+      totalRequests = 3;
+      if (queueResult.status === 'fulfilled') setCoordinator(queueResult.value);
+      if (referralResult.status === 'fulfilled') setReferrals(referralResult.value);
+      if (caseResult.status === 'fulfilled') setCases(caseResult.value);
+      failedCount = [queueResult, referralResult, caseResult].filter((result) => result.status === 'rejected').length;
+    } else if (currentRole === 'APEXCARE_DOCTOR') {
+      // General history is not a doctor approval task. It is exposed to the
+      // assigned clinic clinician from Patient 360; no review API is called here.
+      totalRequests = 0;
+    } else {
+      const [caseResult] = await Promise.allSettled([apexServiceCases()]);
+      totalRequests = 1;
+      if (caseResult.status === 'fulfilled') setCases(caseResult.value);
+      failedCount = caseResult.status === 'rejected' ? 1 : 0;
+    }
+
+    if (totalRequests > 0 && failedCount === totalRequests) {
+      setError('Unable to load the operational queue available to this role. Check your connection and permissions.');
     } else if (failedCount > 0) {
       setError('Some dashboard data could not be loaded. Refresh before relying on these counts.');
     }
@@ -89,6 +111,7 @@ function ApexHome() {
 
   const coordinatorView = role === 'APEXCARE_COORDINATOR';
   const dietitianView = role === 'APEXCARE_DIETITIAN';
+  const doctorView = role === 'APEXCARE_DOCTOR';
   const queueItems = coordinator || [];
   const referralItems = referrals || [];
   const serviceItems = cases || [];
@@ -104,7 +127,7 @@ function ApexHome() {
     );
   }
 
-  if (coordinator === null && referrals === null && cases === null && error) {
+  if (!doctorView && coordinator === null && referrals === null && cases === null && error) {
     return (
       <ApexShell title="ApexCare workspace unavailable" subtitle="The dashboard could not load any operational data.">
         <section className="card glass alert-error section apex-dashboard-error" role="alert">
@@ -117,8 +140,8 @@ function ApexHome() {
 
   return (
     <ApexShell
-      title={coordinatorView ? 'Coordinator workspace' : 'Good morning.'}
-      subtitle={coordinatorView ? 'Move each patient from clinic handoff into a complete, doctor-led care intake.' : dietitianView ? 'Work from assigned service cases and practical nutrition care.' : 'A focused ApexCare operations workspace.'}
+      title={coordinatorView ? 'Coordinator workspace' : doctorView ? 'ApexCare doctor workspace' : 'Good morning.'}
+      subtitle={coordinatorView ? 'Move each patient from clinic handoff into a complete, coordinator-recorded general history.' : doctorView ? 'General history is retained for the assigned clinic clinician to refer to in Patient 360.' : dietitianView ? 'Work from assigned service cases and practical nutrition care.' : 'A focused ApexCare operations workspace.'}
     >
       {error && (
         <div className="card glass alert-error section apex-dashboard-error" role="status">
@@ -130,10 +153,10 @@ function ApexHome() {
       <section className="hero glass page-enter workspace-hero apex-dashboard-hero">
         <div className="apex-dashboard-hero-copy">
           <div className="eyebrow">ApexCare operations · Today</div>
-          <h2>{coordinatorView ? 'Start with the patient, not the contact status.' : dietitianView ? 'Focus on the next care action.' : 'Work from the patient journey.'}</h2>
+          <h2>{coordinatorView ? 'Start with the patient, not the contact status.' : doctorView ? 'Patient history is a reference, not an approval task.' : dietitianView ? 'Focus on the next care action.' : 'Work from the patient journey.'}</h2>
           <p>{coordinatorView
             ? 'Contact is one step. The next intake stage is a guided general medical history, using Yes / No / Unknown answers and follow-up questions only when relevant.'
-            : 'Use the live queues below to open the relevant workflow. Counts reflect API responses, not static targets.'}</p>
+            : doctorView ? 'The ApexCare coordinator records the patient-reported baseline. The assigned clinic clinician can refer to the read-only snapshot in Patient 360.' : 'Use the live queues below to open the relevant workflow. Counts reflect API responses, not static targets.'}</p>
         </div>
         <div className="hero-actions apex-dashboard-hero-actions">
           <button type="button" className="secondary" onClick={() => void load(true)} disabled={refreshing}>
@@ -142,7 +165,7 @@ function ApexHome() {
           </button>
           {coordinatorView && <Link className="primary" href="/apex/queue">Open coordinator queue <ArrowUpRight size={14} /></Link>}
           {dietitianView && <Link className="primary" href="/apex/dietitian">Open dietitian queue <ArrowUpRight size={14} /></Link>}
-          {!coordinatorView && !dietitianView && <Link className="primary" href="/apex/services">Open service cases <ArrowUpRight size={14} /></Link>}
+          {!coordinatorView && !dietitianView && !doctorView && <Link className="primary" href="/apex/services">Open service cases <ArrowUpRight size={14} /></Link>}
         </div>
       </section>
 
@@ -150,8 +173,8 @@ function ApexHome() {
         <div className="card glass stat page-enter apex-dashboard-stat">
           <PhoneCall size={19} aria-hidden="true" />
           <small>{coordinatorView ? 'Coordinator queue' : 'Assigned care queue'}</small>
-          <strong>{coordinatorView ? queueItems.length : openCases.length}</strong>
-          <span className="muted">{coordinatorView ? 'Patient handoffs awaiting next action' : 'Open service cases'}</span>
+          <strong>{coordinatorView ? queueItems.length : doctorView ? '—' : openCases.length}</strong>
+          <span className="muted">{coordinatorView ? 'Patient handoffs awaiting next action' : doctorView ? 'No history approval queue' : 'Open service cases'}</span>
         </div>
         <div className="card glass stat page-enter apex-dashboard-stat">
           <ClipboardList size={19} aria-hidden="true" />
@@ -222,10 +245,15 @@ function ApexHome() {
             </div>
             <div className="apex-history-note">
               <ShieldCheck size={17} aria-hidden="true" />
-              <p>Queue API history status: {queueItems.filter((item) => Boolean(item.generalHistoryStatus)).length} of {queueItems.length} records currently return this field; {queueItems.filter((item) => item.generalHistoryStatus === 'COMPLETED').length} completed, {queueItems.filter((item) => item.generalHistoryStatus === 'IN_PROGRESS').length} in progress, and {queueItems.filter((item) => item.generalHistoryStatus === 'PENDING_REVIEW').length} pending clinician review. Missing values are shown as “NOT RETURNED BY API”, not assumed to be “NOT_STARTED”.</p>
+              <p>Queue API history status: {queueItems.filter((item) => Boolean(item.generalHistoryStatus)).length} of {queueItems.length} records currently return this field; {queueItems.filter((item) => item.generalHistoryStatus === 'RECORDED').length} recorded and {queueItems.filter((item) => item.generalHistoryStatus === 'IN_PROGRESS').length} in progress. Missing values are shown as “NOT RETURNED BY API”, not assumed to be “NOT_STARTED”.</p>
             </div>
-            <div className="apex-history-note"><ShieldCheck size={17} aria-hidden="true" /><p>History status and save actions are not wired yet: the current API supports call outcomes only. This panel is the dashboard preparation, not a claim that history has been collected.</p></div>
+            <div className="apex-history-note"><ShieldCheck size={17} aria-hidden="true" /><p>Coordinators can save drafts and record the completed history. Recorded information is retained as patient history; no clinician approval or rejection is required.</p></div>
             <Link className="secondary full-action" href="/apex/queue">Continue with patient handoffs <ArrowUpRight size={14} /></Link>
+          </div>
+        ) : doctorView ? (
+          <div className="card glass page-enter apex-dashboard-panel">
+            <div className="section-head apex-dashboard-section-head"><div><div className="eyebrow">Patient record ownership</div><h2>Coordinator-recorded history</h2><span className="muted">A clinical reference, not an approval workflow.</span></div><ShieldCheck size={20} aria-hidden="true" /></div>
+            <div className="apex-history-note"><FileText size={17} aria-hidden="true" /><p>The ApexCare coordinator records the information shared by the patient. The assigned clinic clinician can view the recorded snapshot from Patient 360. No approval or rejection action is expected from the ApexCare doctor.</p></div>
           </div>
         ) : (
           <div className="card glass page-enter apex-dashboard-panel">
@@ -252,14 +280,14 @@ function ApexHome() {
 
       <section className="card glass section page-enter apex-dashboard-panel">
         <div className="section-head apex-dashboard-section-head">
-          <div><div className="eyebrow">Operational snapshot</div><h2>Service and referral queues</h2><span className="muted">Use these links to open the workflow; this summary does not change any status.</span></div>
+          <div><div className="eyebrow">Operational snapshot</div><h2>{doctorView ? 'Patient history reference' : 'Service and referral queues'}</h2><span className="muted">Use these links to open the workflow; this summary does not change any status.</span></div>
           <CalendarClock size={20} aria-hidden="true" />
         </div>
         <div className="apex-dashboard-queue-grid">
-          <Link className="apex-dashboard-queue-link" href="/apex/queue"><span><PhoneCall size={16} /> Coordinator calls due</span><b>{queueItems.length}</b></Link>
-          <Link className="apex-dashboard-queue-link" href="/apex/queue"><span><ClipboardList size={16} /> Clinic referrals</span><b>{referralItems.length}</b></Link>
-          <Link className="apex-dashboard-queue-link" href="/apex/services"><span><Users size={16} /> Open service cases</span><b>{openCases.length}</b></Link>
-          <Link className="apex-dashboard-queue-link" href="/apex/queue"><span><Clock3 size={16} /> Pending call outcomes</span><b>{queueItems.filter((item) => !item.coordinatorCallStatus || item.coordinatorCallStatus === 'PENDING').length}</b></Link>
+          {doctorView ? <div className="apex-dashboard-queue-link"><span><FileText size={16} /> History is available in clinic Patient 360</span><b>Reference</b></div> : <Link className="apex-dashboard-queue-link" href="/apex/queue"><span><PhoneCall size={16} /> Coordinator calls due</span><b>{queueItems.length}</b></Link>}
+          {!doctorView && <Link className="apex-dashboard-queue-link" href="/apex/queue"><span><ClipboardList size={16} /> Clinic referrals</span><b>{referralItems.length}</b></Link>}
+          {!doctorView && <Link className="apex-dashboard-queue-link" href="/apex/services"><span><Users size={16} /> Open service cases</span><b>{openCases.length}</b></Link>}
+          {!doctorView && <Link className="apex-dashboard-queue-link" href="/apex/queue"><span><Clock3 size={16} /> Pending call outcomes</span><b>{queueItems.filter((item) => !item.coordinatorCallStatus || item.coordinatorCallStatus === 'PENDING').length}</b></Link>}
         </div>
       </section>
     </ApexShell>

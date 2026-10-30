@@ -1,7 +1,7 @@
 "use client";
 
 import { CoordinatorEnrollment } from "@/components/CordinatorEnrollment";
-import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import {
@@ -14,7 +14,6 @@ import {
   RefreshCw,
   CalendarDays,
   MessageSquareText,
-  Phone,
   Check,
   ClipboardList,
   Clock3,
@@ -29,12 +28,16 @@ import { Shell, Gate } from "@/components/Shell";
 
 import {
   approveDraft,
+  updateDraftPlan,
   clinicalSignals,
   diagnoses,
   drafts,
   labDocuments,
   labInterpretation,
   labResults,
+  uploadLabDocument,
+  retryLabDocument,
+  fetchLabDocumentFile,
   medications,
   carePlanExecution,
   carePlanCommunications,
@@ -44,18 +47,14 @@ import {
   patientById,
   patientCases,
   patientVitals,
+  patientApexGeneralHistory,
   prescriptionDocuments,
-  prescriptionImage,
-  prescriptionOcrStatus,
   medicationDrafts,
   transitionMilestone,
   plans,
   progressSummary,
   rejectDraft,
   uploadPrescription,
-  recordCoordinatorVitals,
-  createOpdVisit,
-  updatePatientContactProfile,
   submitMedicationDraft,
   finalizeMedicationDraft,
 } from "@/lib/api";
@@ -75,14 +74,15 @@ import type {
   CarePlanExecution,
   PrescriptionDocument,
   MedicationDraft,
-  PrescriptionOcrStatus,
+  ApexCareGeneralHistoryPatientSnapshot,
+  ApexCareGeneralHistoryAnswer,
 } from "@/types/api";
 
 import { ClinicalProgressSummary } from '@/components/ClinicalProgressSummary';
+import { APEX_GENERAL_HISTORY_SECTIONS } from '@/lib/apex-general-history';
 
 type Section = "overview" | "care" | "vitals" | "labs" | "medications" | "opd" | "services";
-type DraftMedicationFields = NonNullable<MedicationDraft["medications"]>;
-type DraftMedicationEditableField = "name" | "strength" | "dose" | "route" | "frequency" | "duration" | "instructions";
+type DraftPlanView = { summary: string; goals: Array<{ title: string; target?: string; rationale?: string }>; tasks: Array<{ type: string; title: string; dueDay: number; rationale?: string }>; clinicalInterventionNeeded: boolean; confidence: number; safetyNotes: string[] };
 
 function Badge({ s }: { s?: string }) {
   const tone =
@@ -107,7 +107,6 @@ function readRole() {
 
     if (!raw) {
       return {
-        userId: '',
         clinician: false,
         coordinator: false,
         admin: false,
@@ -115,19 +114,16 @@ function readRole() {
     }
 
     const user = JSON.parse(raw) as {
-      id?: string;
       roles?: string[];
     };
 
     return {
-      userId: user.id || '',
       clinician: user.roles?.includes("CLINICIAN") === true,
       coordinator: user.roles?.includes("CLINIC_COORDINATOR") === true,
       admin: user.roles?.includes("CLINIC_ADMIN") === true,
     };
   } catch {
     return {
-      userId: '',
       clinician: false,
       coordinator: false,
       admin: false,
@@ -139,26 +135,12 @@ function initials(patient: Patient) {
   return `${patient.name.first[0] || ""}${patient.name.last?.[0] || ""}`;
 }
 
-function whatsappHref(phone: string) {
-  const digits = phone.replace(/\D/g, '');
-  if (digits.length === 10) return `https://wa.me/91${digits}`;
-  if (digits.length === 11 && digits.startsWith('0')) return `https://wa.me/91${digits.slice(1)}`;
-  return `https://wa.me/${digits}`;
-}
-
 export default function PatientPage() {
   const { patientId } = useParams<{
     patientId: string;
   }>();
 
-  const [roles, setRoles] = useState({ userId: '', clinician: false, coordinator: false, admin: false });
-  const [rolesLoaded, setRolesLoaded] = useState(false);
-  useEffect(() => {
-    setRoles(readRole());
-    setRolesLoaded(true);
-  }, []);
   const [patient, setPatient] = useState<Patient | null>(null);
-  const loadedPatientIdRef = useRef<string | null>(null);
 
   const [diagnosesList, setDiagnosesList] = useState<Diagnosis[]>([]);
 
@@ -171,36 +153,25 @@ export default function PatientPage() {
   const [services, setServices] = useState<ServiceCase[]>([]);
   const [labDocs, setLabDocs] = useState<LabDocument[]>([]);
   const [labData, setLabData] = useState<Record<string, { results: LabResult[]; interpretation?: LabInterpretation }>>({});
+  const [labUploadBusy, setLabUploadBusy] = useState(false);
   const [signals, setSignals] = useState<ClinicalSignal[]>([]);
   const [medicationList, setMedicationList] = useState<Medication[]>([]);
   const [prescriptions, setPrescriptions] = useState<PrescriptionDocument[]>([]);
   const [prescriptionDrafts, setPrescriptionDrafts] = useState<Record<string, MedicationDraft[]>>({});
-  const [prescriptionImageUrls, setPrescriptionImageUrls] = useState<Record<string, string>>({});
-  const [prescriptionImageBusyId, setPrescriptionImageBusyId] = useState<string | null>(null);
-  const [prescriptionImageErrors, setPrescriptionImageErrors] = useState<Record<string, string>>({});
-  const prescriptionObjectUrls = useRef<string[]>([]);
-  useEffect(() => () => {
-    prescriptionObjectUrls.current.forEach((url) => URL.revokeObjectURL(url));
-    prescriptionObjectUrls.current = [];
-  }, []);
-
-  useEffect(() => {
-    prescriptionObjectUrls.current.forEach((url) => URL.revokeObjectURL(url));
-    prescriptionObjectUrls.current = [];
-    setPrescriptionImageUrls({});
-    setPrescriptionImageErrors({});
-  }, [patientId]);
-  const [editedDraftMedications, setEditedDraftMedications] = useState<Record<string, DraftMedicationFields>>({});
-  const [prescriptionOcrRuntimeStatus, setPrescriptionOcrRuntimeStatus] = useState<PrescriptionOcrStatus | null>(null);
   const [execution, setExecution] = useState<CarePlanExecution | null>(null);
   const [communications, setCommunications] = useState<Array<Record<string, unknown>>>([]);
   const [clinicalActionBusy, setClinicalActionBusy] = useState<string | null>(null);
   const [prescriptionUploadBusy, setPrescriptionUploadBusy] = useState(false);
   const [prescriptionMessage, setPrescriptionMessage] = useState<string | null>(null);
+  const [generalHistory, setGeneralHistory] = useState<ApexCareGeneralHistoryPatientSnapshot | null>(null);
+  const [generalHistoryLoading, setGeneralHistoryLoading] = useState(false);
+  const [generalHistoryError, setGeneralHistoryError] = useState<string | null>(null);
 
   const [careDrafts, setCareDrafts] = useState<Array<Record<string, unknown>>>(
     [],
   );
+  const [editingDraftId, setEditingDraftId] = useState<string | null>(null);
+  const [draftEdits, setDraftEdits] = useState<Record<string, DraftPlanView>>({});
 
   const [clinicalSummary, setClinicalSummary] = useState<Record<
     string,
@@ -214,24 +185,10 @@ export default function PatientPage() {
   const [section, setSection] = useState<Section>("overview");
 
   const [message, setMessage] = useState("");
-  const [patientLoadError, setPatientLoadError] = useState<string | null>(null);
-  const [patientLoading, setPatientLoading] = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
-  const [dataIssues, setDataIssues] = useState<string[]>([]);
-  const [lastUpdated, setLastUpdated] = useState<string | null>(null);
-  const [vitalsBusy, setVitalsBusy] = useState(false);
-  const [opdForm, setOpdForm] = useState({ reason: 'Chronic care follow-up', assessment: '', planAdjustment: '', vitalsRecordId: '' });
-  const [opdBusy, setOpdBusy] = useState(false);
-  const [contactEditOpen, setContactEditOpen] = useState(false);
-  const [contactSaving, setContactSaving] = useState(false);
-  const [contactForm, setContactForm] = useState({ phone: '', whatsapp: '', preferredLanguage: 'en', preferredContactChannel: 'PHONE' as 'PHONE' | 'SMS' | 'WHATSAPP' | 'APP' });
-  const [vitalsForm, setVitalsForm] = useState({
-    systolic: '', diastolic: '', pulse: '', weightKg: '', bloodSugar: '',
-    bloodSugarType: 'RANDOM' as 'FASTING' | 'POST_PRANDIAL' | 'RANDOM',
-    symptoms: '', notes: '', source: 'OPD' as 'OPD' | 'HOME' | 'DEVICE',
-  });
 
   const [busy, setBusy] = useState(false);
+
+  const roles = readRole();
 
   const clinician = roles.clinician;
   const coordinator = roles.coordinator;
@@ -260,184 +217,125 @@ export default function PatientPage() {
 
 
 
-  const refreshPrescriptionWorkflow = useCallback(async () => {
-    const documents = await prescriptionDocuments(patientId);
-    setPrescriptions(documents);
-    let draftFailures = 0;
-    const draftEntries = await Promise.all(documents.slice(0, 6).map(async (document) => {
-      try {
-        return [document._id, await medicationDrafts(patientId, document._id)] as const;
-      } catch {
-        draftFailures += 1;
-        return [document._id, []] as const;
-      }
-    }));
-    setPrescriptionDrafts(Object.fromEntries(draftEntries));
-    return { documents, draftFailures };
-  }, [patientId]);
+  async function refresh() {
+    const patientRecord = await patientById(patientId);
 
-  const refresh = useCallback(async () => {
-    setRefreshing(true);
-    setPatientLoadError(null);
-    setDataIssues([]);
-    if (loadedPatientIdRef.current !== patientId) {
-      setPatientLoading(true);
-      setPatient(null);
-      setLastUpdated(null);
+    setPatient(patientRecord);
+
+    const [
+      diagnosisResult,
+      carePlanResult,
+      vitalsResult,
+      opdResult,
+      serviceResult,
+    ] = await Promise.allSettled([
+      diagnoses(patientId),
+      plans(patientId),
+      patientVitals(patientId),
+      opd(patientId),
+      patientCases(patientId),
+    ]);
+
+    if (diagnosisResult.status === "fulfilled") {
+      setDiagnosesList(diagnosisResult.value);
     }
-    const issues: string[] = [];
 
-    try {
-      let patientRecord: Patient;
-      try {
-        patientRecord = await patientById(patientId);
-        loadedPatientIdRef.current = patientId;
-        setPatient(patientRecord);
-      } catch (error) {
-        const detail = error instanceof Error ? error.message : 'Unable to load patient record.';
-        setPatientLoadError(detail);
-        throw error;
+    if (carePlanResult.status === "fulfilled") {
+      setCarePlans(carePlanResult.value);
+    }
+
+    if (vitalsResult.status === "fulfilled") {
+      setVitals(vitalsResult.value);
+    }
+
+    if (opdResult.status === "fulfilled") {
+      setOpdVisits(opdResult.value);
+    }
+
+    if (serviceResult.status === "fulfilled") {
+      setServices(serviceResult.value);
+    }
+
+    const [medsResult, prescriptionResult] = await Promise.allSettled([
+      medications(patientId),
+      prescriptionDocuments(patientId),
+    ]);
+
+    if (medsResult.status === "fulfilled") setMedicationList(medsResult.value);
+    if (prescriptionResult.status === "fulfilled") {
+      setPrescriptions(prescriptionResult.value);
+      const draftEntries = await Promise.all(prescriptionResult.value.slice(0, 6).map(async (document) => {
+        try { return [document._id, await medicationDrafts(patientId, document._id)] as const; } catch { return [document._id, []] as const; }
+      }));
+      setPrescriptionDrafts(Object.fromEntries(draftEntries));
+    }
+
+    if (coordinator) {
+      const communicationResult = await Promise.allSettled([carePlanCommunications(patientId)]);
+      if (communicationResult[0].status === "fulfilled") setCommunications(communicationResult[0].value);
+    }
+
+    if (clinician || coordinator) {
+      setGeneralHistoryLoading(true);
+      setGeneralHistoryError(null);
+      const [labsResult, signalResult, historyResult] = await Promise.allSettled([
+        labDocuments(patientId),
+        clinician ? clinicalSignals(patientId) : Promise.resolve([]),
+        clinician ? patientApexGeneralHistory(patientId) : Promise.resolve(null),
+      ]);
+      if (historyResult.status === 'fulfilled') {
+        setGeneralHistory(historyResult.value);
+      } else {
+        setGeneralHistory(null);
+        setGeneralHistoryError(historyResult.reason instanceof Error ? historyResult.reason.message : 'Unable to load coordinator-recorded history.');
       }
+      setGeneralHistoryLoading(false);
+      if (labsResult.status === "fulfilled") {
+        setLabDocs(labsResult.value);
+        const entries = clinician ? await Promise.all(labsResult.value.slice(0, 8).map(async (doc) => {
+          try {
+            const [resultSet, interpretation] = await Promise.allSettled([labResults(patientId, doc._id), labInterpretation(patientId, doc._id)]);
+            return [doc._id, { results: resultSet.status === "fulfilled" ? resultSet.value.results : [], interpretation: interpretation.status === "fulfilled" ? interpretation.value : undefined }] as const;
+          } catch { return [doc._id, { results: [] }] as const; }
+        })) : [];
+        setLabData(Object.fromEntries(entries));
+      }
+      if (signalResult.status === "fulfilled") setSignals(signalResult.value);
+    }
 
-      const [diagnosisResult, carePlanResult, vitalsResult, opdResult, serviceResult] = await Promise.allSettled([
-        diagnoses(patientId), plans(patientId), patientVitals(patientId), opd(patientId), patientCases(patientId),
+    // --------------------------------------------------------
+    // Clinician-only clinical intelligence
+    // --------------------------------------------------------
+
+    if (clinician) {
+      const [draftsResult, summaryResult] = await Promise.allSettled([
+        drafts(patientId),
+        progressSummary(patientId),
       ]);
 
-      if (diagnosisResult.status === 'fulfilled') setDiagnosesList(diagnosisResult.value);
-      else { setDiagnosesList([]); issues.push('diagnoses'); }
-
-      if (carePlanResult.status === 'fulfilled') setCarePlans(carePlanResult.value);
-      else { setCarePlans([]); setExecution(null); issues.push('care plans'); }
-
-      if (vitalsResult.status === 'fulfilled') setVitals(vitalsResult.value);
-      else { setVitals([]); issues.push('vitals'); }
-
-      if (opdResult.status === 'fulfilled') setOpdVisits(opdResult.value);
-      else { setOpdVisits([]); issues.push('OPD history'); }
-
-      if (serviceResult.status === 'fulfilled') setServices(serviceResult.value);
-      else { setServices([]); issues.push('ApexCare service cases'); }
-
-      const [medsResult, prescriptionResult] = await Promise.allSettled([
-        medications(patientId), refreshPrescriptionWorkflow(),
-      ]);
-      if (medsResult.status === 'fulfilled') setMedicationList(medsResult.value);
-      else { setMedicationList([]); issues.push('medications'); }
-      if (prescriptionResult.status === 'rejected') {
-        setPrescriptions([]);
-        setPrescriptionDrafts({});
-        issues.push('prescription documents');
-      } else if (prescriptionResult.value.draftFailures > 0) {
-        issues.push('some prescription draft details');
+      if (draftsResult.status === "fulfilled") {
+        setCareDrafts(draftsResult.value);
       }
 
-      if (coordinator) {
-        const communicationResult = await Promise.allSettled([carePlanCommunications(patientId)]);
-        if (communicationResult[0].status === 'fulfilled') setCommunications(communicationResult[0].value);
-        else { setCommunications([]); issues.push('communication history'); }
+      if (summaryResult.status === "fulfilled") {
+        setClinicalSummary(summaryResult.value);
       }
-
-      if (clinician) {
-        const [labsResult, signalResult, draftsResult, summaryResult] = await Promise.allSettled([
-          labDocuments(patientId), clinicalSignals(patientId), drafts(patientId), progressSummary(patientId),
-        ]);
-
-        if (labsResult.status === 'fulfilled') {
-          setLabDocs(labsResult.value);
-          const entries = await Promise.all(labsResult.value.slice(0, 8).map(async (doc) => {
-            const [resultSet, interpretation] = await Promise.allSettled([
-              labResults(patientId, doc._id), labInterpretation(patientId, doc._id),
-            ]);
-            return [doc._id, {
-              results: resultSet.status === 'fulfilled' ? resultSet.value.results : [],
-              interpretation: interpretation.status === 'fulfilled' ? interpretation.value : undefined,
-              resultsRequestFailed: resultSet.status === 'rejected',
-            }] as const;
-          }));
-          setLabData(Object.fromEntries(entries.map(([documentId, value]) => [documentId, { results: value.results, interpretation: value.interpretation }])));
-          if (entries.some(([, value]) => value.resultsRequestFailed)) issues.push('some laboratory result details');
-        } else { setLabDocs([]); setLabData({}); issues.push('laboratory reports'); }
-
-        if (signalResult.status === 'fulfilled') setSignals(signalResult.value);
-        else { setSignals([]); issues.push('clinical signals'); }
-        if (draftsResult.status === 'fulfilled') setCareDrafts(draftsResult.value);
-        else { setCareDrafts([]); issues.push('care-plan drafts'); }
-        if (summaryResult.status === 'fulfilled') setClinicalSummary(summaryResult.value);
-        else { setClinicalSummary(null); issues.push('clinical progress summary'); }
-      }
-
-      if (carePlanResult.status === 'fulfilled') {
-        const selectedPlan = carePlanResult.value.find((plan) => plan.status === 'ACTIVE') || carePlanResult.value[0];
-        if (selectedPlan) {
-          const executionResult = await Promise.allSettled([carePlanExecution(patientId, selectedPlan._id)]);
-          if (executionResult[0].status === 'fulfilled') setExecution(executionResult[0].value);
-          else { setExecution(null); issues.push('care-plan execution details'); }
-        } else {
-          setExecution(null);
-        }
-      }
-
-      const uniqueIssues = [...new Set(issues)];
-      setDataIssues(uniqueIssues);
-      setLastUpdated(new Date().toISOString());
-    } finally {
-      setPatientLoading(false);
-      setRefreshing(false);
     }
-  }, [patientId, coordinator, clinician, refreshPrescriptionWorkflow]);
+
+    if (carePlanResult.status === "fulfilled" && carePlanResult.value[0]) {
+      const executionResult = await Promise.allSettled([carePlanExecution(patientId, carePlanResult.value[0]._id)]);
+      if (executionResult[0].status === "fulfilled") setExecution(executionResult[0].value);
+    }
+  }
+
 
   useEffect(() => {
-    if (!rolesLoaded) return;
-    let active = true;
     refresh().catch((error) => {
-      if (active) setPatientLoadError(error instanceof Error ? error.message : 'Unable to load patient.');
+      setMessage(
+        error instanceof Error ? error.message : "Unable to load patient.",
+      );
     });
-    return () => { active = false; };
-  }, [refresh, rolesLoaded]);
-
-  useEffect(() => {
-    let active = true;
-    prescriptionOcrStatus()
-      .then((status) => { if (active) setPrescriptionOcrRuntimeStatus(status); })
-      .catch(() => { if (active) setPrescriptionOcrRuntimeStatus(null); });
-    return () => { active = false; };
-  }, []);
-
-  const prescriptionAnalysisPending = prescriptions.some((document) =>
-    document.analysisStatus === 'PENDING' || document.analysisStatus === 'PROCESSING' || document.status === 'ANALYZING'
-  );
-
-  useEffect(() => {
-    if (!prescriptionAnalysisPending) return;
-    let cancelled = false;
-    let timer: number | undefined;
-
-    const poll = async () => {
-      try {
-        const documents = await prescriptionDocuments(patientId);
-        if (cancelled) return;
-        setPrescriptions(documents);
-        const entries = await Promise.all(documents.slice(0, 6).map(async (document) => {
-          try { return [document._id, await medicationDrafts(patientId, document._id)] as const; }
-          catch { return [document._id, []] as const; }
-        }));
-        if (cancelled) return;
-        setPrescriptionDrafts(Object.fromEntries(entries));
-        const stillPending = documents.some((document) =>
-          document.analysisStatus === 'PENDING' || document.analysisStatus === 'PROCESSING' || document.status === 'ANALYZING'
-        );
-        if (stillPending) timer = window.setTimeout(poll, 4000);
-      } catch {
-        if (!cancelled) timer = window.setTimeout(poll, 6000);
-      }
-    };
-
-    timer = window.setTimeout(poll, 3500);
-    return () => {
-      cancelled = true;
-      if (timer !== undefined) window.clearTimeout(timer);
-    };
-  }, [patientId, prescriptionAnalysisPending]);
+  }, [patientId, clinician]);
 
   async function handleMilestone(milestoneId: string, action: 'COMPLETE' | 'SKIP') {
     if (!activePlan) return;
@@ -447,70 +345,7 @@ export default function PatientPage() {
       if (execution) {
         setExecution({ ...execution, milestones: execution.milestones.map((item) => String(item._id) === milestoneId ? { ...item, ...(result as { milestone?: Record<string, unknown> }).milestone } : item) });
       }
-      setMessage(action === 'COMPLETE' ? 'Milestone marked complete.' : 'Milestone skipped.');
-      await refresh();
     } catch (error) { setMessage(error instanceof Error ? error.message : 'Unable to update the care milestone.'); } finally { setClinicalActionBusy(null); }
-  }
-
-  async function handleVitalsSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    setMessage('');
-    const systolic = vitalsForm.systolic.trim();
-    const diastolic = vitalsForm.diastolic.trim();
-    if (Boolean(systolic) !== Boolean(diastolic)) {
-      setMessage('Enter both systolic and diastolic blood pressure, or leave both blank.');
-      return;
-    }
-    if (systolic && diastolic && Number(systolic) <= Number(diastolic)) {
-      setMessage('Systolic blood pressure should be greater than diastolic blood pressure. Check the reading before saving.');
-      return;
-    }
-    const payload: Parameters<typeof recordCoordinatorVitals>[1] = {
-      recordedAt: new Date().toISOString(),
-      source: vitalsForm.source,
-      symptoms: vitalsForm.symptoms.split(/[\n,]/).map((item) => item.trim()).filter(Boolean),
-      notes: vitalsForm.notes.trim() || undefined,
-    };
-    if (systolic && diastolic) {
-      payload.bloodPressure = {
-        systolic: Number(systolic),
-        diastolic: Number(diastolic),
-        ...(vitalsForm.pulse.trim() ? { pulse: Number(vitalsForm.pulse) } : {}),
-      };
-    } else if (vitalsForm.pulse.trim()) {
-      setMessage('Enter blood pressure with pulse, or clear the pulse field.');
-      return;
-    }
-    if (vitalsForm.weightKg.trim()) payload.weightKg = Number(vitalsForm.weightKg);
-    if (vitalsForm.bloodSugar.trim()) {
-      payload.bloodSugar = { value: Number(vitalsForm.bloodSugar), type: vitalsForm.bloodSugarType, unit: 'MG_DL' };
-    }
-    if (!payload.bloodPressure && !payload.weightKg && !payload.bloodSugar && !payload.symptoms?.length) {
-      setMessage('Enter at least one measurement or symptom before saving.');
-      return;
-    }
-    const validNumeric = [payload.bloodPressure?.systolic, payload.bloodPressure?.diastolic, payload.bloodPressure?.pulse, payload.weightKg, payload.bloodSugar?.value]
-      .filter((value) => value !== undefined).every((value) => Number.isFinite(value));
-    if (!validNumeric) {
-      setMessage('Measurements must be valid numbers.');
-      return;
-    }
-    setVitalsBusy(true);
-    try {
-      await recordCoordinatorVitals(patientId, payload);
-      setVitalsForm({ systolic: '', diastolic: '', pulse: '', weightKg: '', bloodSugar: '', bloodSugarType: 'RANDOM', symptoms: '', notes: '', source: 'OPD' });
-      setMessage('Vitals saved successfully.');
-      setSection('vitals');
-      try {
-        await refresh();
-      } catch {
-        setMessage('Vitals were saved, but Patient 360 could not refresh all data. Use Refresh Data to retry.');
-      }
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'Unable to save vitals.');
-    } finally {
-      setVitalsBusy(false);
-    }
   }
 
   async function handleLabReview(documentId: string, decision: 'APPROVED' | 'MODIFIED' | 'REJECTED') {
@@ -528,6 +363,42 @@ export default function PatientPage() {
     }
   }
 
+  async function handleLabUpload(file?: File) {
+    if (!file) return;
+    if (file.type !== 'application/pdf') { setMessage('Choose a PDF lab report.'); return; }
+    setLabUploadBusy(true);
+    try {
+      await uploadLabDocument(patientId, file);
+      setMessage('Lab report uploaded. OCR and extraction are queued.');
+      await refreshClinicalData();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : 'Unable to upload the lab report.');
+    } finally { setLabUploadBusy(false); }
+  }
+
+  async function handleLabRetry(documentId: string, stage: 'OCR' | 'AI_EXTRACTION') {
+    setClinicalActionBusy(`lab-retry:${documentId}`);
+    try {
+      await retryLabDocument(patientId, documentId, stage);
+      setMessage(`${stage === 'OCR' ? 'OCR' : 'AI extraction'} retry queued.`);
+      await refreshClinicalData();
+    } catch (error) { setMessage(error instanceof Error ? error.message : 'Unable to retry document processing.'); }
+    finally { setClinicalActionBusy(null); }
+  }
+
+  async function handleOpenLabFile(documentId: string) {
+    try {
+      const blob = await fetchLabDocumentFile(patientId, documentId);
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.target = '_blank';
+      link.rel = 'noopener';
+      link.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    } catch (error) { setMessage(error instanceof Error ? error.message : 'Unable to open the lab report.'); }
+  }
+
   async function handleSignalReview(signalId: string, decision: 'ACTION_REQUIRED' | 'REVIEWED' | 'DISMISSED') {
     setClinicalActionBusy(`signal:${signalId}`);
     setMessage("");
@@ -541,193 +412,25 @@ export default function PatientPage() {
     }
   }
 
-  async function handleOpdSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    setMessage('');
-    if (!roles.userId || String(patient?.assignedClinicianId || '') !== roles.userId) {
-      setMessage('Only the assigned clinician can document this OPD visit.');
-      return;
-    }
-    if (!opdForm.reason.trim()) {
-      setMessage('Enter a reason for the OPD visit.');
-      return;
-    }
-    setOpdBusy(true);
-    try {
-      await createOpdVisit(patientId, {
-        clinicianId: roles.userId,
-        visitAt: new Date().toISOString(),
-        reason: opdForm.reason.trim(),
-        assessment: opdForm.assessment.trim() || undefined,
-        planAdjustment: opdForm.planAdjustment.trim() || undefined,
-        carePlanId: activePlan?._id,
-        vitalsRecordId: opdForm.vitalsRecordId || undefined,
-      });
-      setOpdForm({ reason: 'Chronic care follow-up', assessment: '', planAdjustment: '', vitalsRecordId: '' });
-      setMessage('OPD visit saved successfully.');
-      setSection('opd');
-      try {
-        await refresh();
-      } catch {
-        setMessage('The OPD visit was saved, but Patient 360 could not refresh all data. Use Refresh Data to retry.');
-      }
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'Unable to save OPD visit.');
-    } finally {
-      setOpdBusy(false);
-    }
-  }
-
-  function openContactEditor() {
-    if (!patient) return;
-    setContactForm({
-      phone: patient.phone || '',
-      whatsapp: patient.whatsapp || '',
-      preferredLanguage: patient.preferredLanguage || 'en',
-      preferredContactChannel: patient.preferredContactChannel || 'PHONE',
-    });
-    setContactEditOpen(true);
-    setMessage('');
-  }
-
-  async function handleContactProfileSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!coordinator && !admin) {
-      setMessage('Only clinic coordinators and clinic admins can update contact details.');
-      return;
-    }
-    const phone = contactForm.phone.trim();
-    if (phone && phone.length < 7) {
-      setMessage('Enter a valid phone number with at least 7 characters.');
-      return;
-    }
-    if (!phone || phone.length < 7) {
-      setMessage('Enter a valid primary phone number (at least 7 characters).');
-      return;
-    }
-    const language = contactForm.preferredLanguage.trim();
-    if (language.length < 2) {
-      setMessage('Enter a preferred language code or name (at least 2 characters).');
-      return;
-    }
-    if (contactForm.preferredContactChannel === 'WHATSAPP' && !contactForm.whatsapp.trim()) {
-      setMessage('Add a WhatsApp number or choose another preferred contact channel.');
-      return;
-    }
-    setContactSaving(true);
-    setMessage('');
-    try {
-      const payload = {
-        phone,
-        whatsapp: contactForm.whatsapp.trim(),
-        preferredLanguage: language,
-        preferredContactChannel: contactForm.preferredContactChannel,
-      };
-      const updated = await updatePatientContactProfile(patientId, payload);
-      setPatient(updated);
-      setContactEditOpen(false);
-      setMessage('Patient contact details updated.');
-      try {
-        await refresh();
-      } catch {
-        setMessage('Contact details were saved, but Patient 360 could not refresh all data. Use Refresh Data to retry.');
-      }
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'Unable to update contact details.');
-    } finally {
-      setContactSaving(false);
-    }
-  }
-
-  async function togglePrescriptionImage(documentId: string) {
-    const existing = prescriptionImageUrls[documentId];
-    if (existing) {
-      URL.revokeObjectURL(existing);
-      setPrescriptionImageUrls((current) => {
-        const next = { ...current };
-        delete next[documentId];
-        return next;
-      });
-      return;
-    }
-    setPrescriptionImageBusyId(documentId);
-    setPrescriptionImageErrors((current) => ({ ...current, [documentId]: '' }));
-    try {
-      const blob = await prescriptionImage(patientId, documentId);
-      const url = URL.createObjectURL(blob);
-      prescriptionObjectUrls.current.push(url);
-      setPrescriptionImageUrls((current) => ({ ...current, [documentId]: url }));
-    } catch (error) {
-      setPrescriptionImageErrors((current) => ({ ...current, [documentId]: error instanceof Error ? error.message : 'Unable to load the original prescription.' }));
-    } finally {
-      setPrescriptionImageBusyId(null);
-    }
-  }
-
   async function handlePrescriptionCapture(file: File) {
-    if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type)) {
-      setPrescriptionMessage('Please choose a JPG, PNG, or WebP prescription image.');
-      return;
-    }
-    if (file.size > 5 * 1024 * 1024) {
-      setPrescriptionMessage('The prescription image must be 5 MB or smaller. Retake or resize the image and try again.');
-      return;
-    }
+    if (!file.type.startsWith('image/')) { setPrescriptionMessage('Please choose a prescription image.'); return; }
     setPrescriptionUploadBusy(true);
     setPrescriptionMessage(null);
     try {
       await uploadPrescription(patientId, file);
-      setPrescriptionMessage('Prescription captured. Recognition is running in the background; results will update automatically.');
+      setPrescriptionMessage('Prescription captured. Analysis is running in the background.');
       await refresh();
     } catch (error) {
       setPrescriptionMessage(error instanceof Error ? error.message : 'Unable to capture the prescription.');
     } finally { setPrescriptionUploadBusy(false); }
   }
 
-  function updateDraftMedicationField(
-    draftId: string,
-    initialMedications: DraftMedicationFields,
-    index: number,
-    field: DraftMedicationEditableField,
-    value: string,
-  ) {
-    setEditedDraftMedications((current) => {
-      const list = [...(current[draftId] ?? initialMedications)];
-      const existing = list[index];
-      if (!existing) return current;
-      list[index] = { ...existing, [field]: value, confidence: undefined, sourceText: undefined };
-      return { ...current, [draftId]: list };
-    });
-  }
-
-  function addDraftMedication(draftId: string, initialMedications: DraftMedicationFields) {
-    setEditedDraftMedications((current) => ({
-      ...current,
-      [draftId]: [...(current[draftId] ?? initialMedications), { name: '' }],
-    }));
-  }
-
-  function removeDraftMedication(draftId: string, initialMedications: DraftMedicationFields, index: number) {
-    setEditedDraftMedications((current) => ({
-      ...current,
-      [draftId]: (current[draftId] ?? initialMedications).filter((_, itemIndex) => itemIndex !== index),
-    }));
-  }
-
   async function handleDraftSubmit(documentId: string, draft: MedicationDraft) {
-    const candidates = (editedDraftMedications[draft._id] ?? draft.medications ?? []).map((medication) => ({
-      ...medication,
-      name: medication.name.trim(),
-    }));
-    if (!candidates.length || candidates.some((medication) => !medication.name)) {
-      setPrescriptionMessage('Add at least one medicine and provide a name for every row before submitting.');
-      return;
-    }
     setClinicalActionBusy(`draft:${draft._id}`);
     setPrescriptionMessage(null);
     try {
-      await submitMedicationDraft(patientId, documentId, draft._id, candidates);
-      setPrescriptionMessage('Medication list submitted for verification. The OCR output remains a draft until the clinical review is complete.');
+      await submitMedicationDraft(patientId, documentId, draft._id, draft.medications || []);
+      setPrescriptionMessage('Medication list submitted for verification.');
       await refresh();
     } catch (error) { setPrescriptionMessage(error instanceof Error ? error.message : 'Unable to submit medication list.'); }
     finally { setClinicalActionBusy(null); }
@@ -754,7 +457,6 @@ export default function PatientPage() {
   // ==========================================================
 
   const latestVital = vitals[0];
-  const bloodPressureVitals = useMemo(() => vitals.filter((item) => item.bloodPressure?.systolic !== undefined), [vitals]);
 
   const latestBP = latestVital?.bloodPressure;
 
@@ -763,18 +465,9 @@ export default function PatientPage() {
 
   const latestOPD = opdVisits[0];
 
-  const currentConditions = useMemo(() => {
-    const fromDiagnoses = diagnosesList.filter((item) => item.status !== 'INACTIVE').map((item) => item.condition);
-    const fromPatient = (patient?.conditions || []).filter((item) => item.status !== 'INACTIVE').map((item) => item.code);
-    return [...new Set([...fromDiagnoses, ...fromPatient])];
-  }, [diagnosesList, patient]);
-
-  const nextMilestone = useMemo(() => {
-    const milestones = execution?.milestones || [];
-    return milestones
-      .filter((item) => !['COMPLETED', 'SKIPPED', 'CANCELLED'].includes(String(item.status || '').toUpperCase()))
-      .sort((a, b) => new Date(String(a.dueAt || a.scheduledAt || 0)).getTime() - new Date(String(b.dueAt || b.scheduledAt || 0)).getTime())[0];
-  }, [execution]);
+  const diagnosis = diagnosesList.find(
+    (item) => item.condition === "HYPERTENSION",
+  );
 
   const carePlanDays = useMemo(() => {
     if (!activePlan?.startDate) {
@@ -837,6 +530,25 @@ async function handleEnrollmentCompleted() {
     }
   }
 
+  function startDraftEdit(draftId: string, plan: DraftPlanView) {
+    setDraftEdits((current) => ({ ...current, [draftId]: JSON.parse(JSON.stringify(plan)) as DraftPlanView }));
+    setEditingDraftId(draftId);
+  }
+
+  async function saveDraftEdit(draftId: string) {
+    const plan = draftEdits[draftId];
+    if (!plan) return;
+    setBusy(true); setMessage("");
+    try {
+      const updated = await updateDraftPlan(patientId, draftId, plan as unknown as Record<string, unknown>);
+      setCareDrafts((current) => current.map((draft) => String(draft._id) === draftId ? updated : draft));
+      setEditingDraftId(null);
+      setMessage("Clinician edits saved to the draft. Review and approve it when ready.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Unable to save draft edits.");
+    } finally { setBusy(false); }
+  }
+
   // ==========================================================
   // LOADING
   // ==========================================================
@@ -854,17 +566,13 @@ async function handleEnrollmentCompleted() {
         </Link>
 
         {!patient ? (
-          <div className="card glass patient360-load-state" style={{ marginTop: 12 }}>
-            {patientLoadError ? (
-              <div role="alert" className="patient360-load-error">
-                <AlertTriangle size={20} />
-                <div><b>Patient record could not be loaded</b><p>{patientLoadError}</p>
-                  <button type="button" className="primary" disabled={refreshing} onClick={() => { void refresh().catch(() => undefined); }}>
-                    <RefreshCw size={14} className={refreshing ? 'spin' : ''} /> Try again
-                  </button>
-                </div>
-              </div>
-            ) : <><RefreshCw size={18} className="spin" /> {patientLoading || !rolesLoaded ? 'Loading patient workspace…' : 'Patient record not available yet.'}</>}
+          <div
+            className="card glass"
+            style={{
+              marginTop: 12,
+            }}
+          >
+            Loading patient workspace…
           </div>
         ) : (
           <>
@@ -891,14 +599,14 @@ async function handleEnrollmentCompleted() {
                       <p>
                         {patient.medicalRecordNumber || "No MRN"}
                         {" · "}
-                        {(currentConditions.length ? currentConditions.map((condition) => condition.replaceAll('_', ' ')).join(' · ') : 'Diagnosis pending')} · Awaiting enrolment
+                        Hypertension · Awaiting enrolment
                       </p>
                     </div>
                   </div>
 
                   <div className="patient360-status">
                     <Badge s="NOT_ENROLLED" />
-                    {diagnosesList[0] && <Badge s={diagnosesList[0].status} />}
+                    {diagnosis && <Badge s={diagnosis.status} />}
                   </div>
                 </section>
 
@@ -969,7 +677,7 @@ async function handleEnrollmentCompleted() {
                 <div className="patient360-avatar">{initials(patient)}</div>
 
                 <div>
-                  <div className="eyebrow">Patient clinical workspace</div>
+                  <div className="eyebrow">Hypertension program</div>
 
                   <h2>
                     {patient.name.first} {patient.name.last}
@@ -979,51 +687,20 @@ async function handleEnrollmentCompleted() {
                     {patient.medicalRecordNumber || "No MRN"}
                     {" · "}
                     {patient.phone || "No phone"}
-                    {patient.dateOfBirth ? ` · DOB ${new Date(patient.dateOfBirth).toLocaleDateString()}` : ''}
                   </p>
-                  <div className="patient360-condition-tags">
-                    {currentConditions.length ? currentConditions.map((condition) => <span className="badge blue" key={condition}>{condition.replaceAll('_', ' ')}</span>) : <span className="muted">No structured diagnosis recorded</span>}
-                  </div>
                 </div>
               </div>
 
               <div className="patient360-status">
                 <Badge s={patient.enrollmentStatus} />
 
-                {diagnosesList[0] && <Badge s={diagnosesList[0].status} />}
+                {diagnosis && <Badge s={diagnosis.status} />}
 
                 {clinician && patient.enrollmentStatus === "CARE_PLAN_REVIEW" && (
                   <span className="badge warn">Care plan review pending</span>
                 )}
               </div>
             </section>
-
-            <section className="patient360-actionbar card glass" aria-label="Patient actions">
-              <div className="patient360-action-context">
-                <b>Quick actions</b>
-                <span className="muted">{lastUpdated ? `Data refreshed ${new Date(lastUpdated).toLocaleTimeString()}` : 'Data status not yet confirmed'}</span>
-              </div>
-              <div className="patient360-action-buttons">
-                {patient.phone && <a className="secondary" href={`tel:${patient.phone}`}><Phone size={14} /> Call patient</a>}
-                {coordinator && <Link className="secondary" href="/reviews"><ClipboardList size={14} /> Reviews</Link>}
-                <button type="button" className="secondary" onClick={() => setSection('vitals')}><HeartPulse size={14} /> Record vitals</button>
-                <button type="button" className="secondary" onClick={() => setSection('medications')}><FileText size={14} /> Prescriptions</button>
-                <button type="button" className="primary" onClick={() => { void refresh().catch(() => undefined); }} disabled={refreshing} aria-busy={refreshing}>
-                  <RefreshCw size={14} className={refreshing ? 'spin' : ''} /> {refreshing ? 'Refreshing…' : 'Refresh data'}
-                </button>
-              </div>
-            </section>
-
-            {dataIssues.length > 0 && <div className="patient360-data-warning" role="status">
-              <AlertTriangle size={17} />
-              <div><b>Some patient data could not be refreshed</b><span>Unavailable: {dataIssues.join(', ')}. Other sections may still be current.</span></div>
-              <button type="button" className="secondary" disabled={refreshing} onClick={() => { void refresh().catch(() => undefined); }}>Retry</button>
-            </div>}
-            {patientLoadError && <div className="patient360-data-warning" role="alert">
-              <AlertTriangle size={17} />
-              <div><b>Patient record refresh failed</b><span>{patientLoadError} The last successfully loaded patient details remain visible; retry before relying on fresh data.</span></div>
-              <button type="button" className="secondary" disabled={refreshing} onClick={() => { void refresh().catch(() => undefined); }}>Retry</button>
-            </div>}
 
             {/* =================================================
                 QUICK METRIC STRIP
@@ -1069,9 +746,11 @@ async function handleEnrollmentCompleted() {
               </div>
 
               <div className="metric-card glass">
-                <span>Next milestone</span>
-                <strong>{nextMilestone ? String(nextMilestone.title || nextMilestone.name || nextMilestone.key || 'Due') : '—'}</strong>
-                <small>{nextMilestone && (nextMilestone.dueAt || nextMilestone.scheduledAt) ? new Date(String(nextMilestone.dueAt || nextMilestone.scheduledAt)).toLocaleDateString() : 'No upcoming milestone loaded'}</small>
+                <span>ApexCare</span>
+
+                <strong>{services.length}</strong>
+
+                <small>Service requests</small>
               </div>
             </div>
 
@@ -1080,9 +759,13 @@ async function handleEnrollmentCompleted() {
                 ================================================= */}
 
             {message && (
-              <div className="alert patient360-flash" role="status" style={{ marginTop: 14 }}>
-                <span>{message}</span>
-                <button type="button" className="icon-button" aria-label="Dismiss message" onClick={() => setMessage('')}><X size={14} /></button>
+              <div
+                className="alert"
+                style={{
+                  marginTop: 14,
+                }}
+              >
+                {message}
               </div>
             )}
 
@@ -1135,7 +818,7 @@ async function handleEnrollmentCompleted() {
                 ["overview", "Overview"],
                 ["care", "Care plan"],
                 ["vitals", "Vitals"],
-                ...(clinician ? [["labs", "Labs"]] : []),
+                ...((clinician || coordinator) ? [["labs", "Labs"]] : []),
                 ["medications", "Medicines"],
                 ["opd", "OPD"],
                 ["services", "ApexCare"],
@@ -1162,43 +845,6 @@ async function handleEnrollmentCompleted() {
                 {/* MAIN COLUMN */}
 
                 <div className="patient360-main">
-                  <section className="card glass">
-                    <div className="section-head"><div><div className="eyebrow">Patient profile</div><h2>Identity and contact</h2></div><ShieldCheck size={18} /></div>
-                    <div className="patient360-detail-grid">
-                      <div><span>Medical record number</span><b>{patient.medicalRecordNumber || 'Not recorded'}</b></div>
-                      <div><span>Phone</span>{patient.phone ? <a href={`tel:${patient.phone}`}>{patient.phone}</a> : <b>Not recorded</b>}</div>
-                      <div><span>WhatsApp</span>{patient.whatsapp ? <a href={whatsappHref(patient.whatsapp)} target="_blank" rel="noreferrer">{patient.whatsapp}</a> : <b>Not recorded</b>}</div>
-                      <div><span>Date of birth / age</span><b>{patient.dateOfBirth ? `${new Date(patient.dateOfBirth).toLocaleDateString()} · ${Math.max(0, Math.floor((Date.now() - new Date(patient.dateOfBirth).getTime()) / (365.2425 * 24 * 60 * 60 * 1000)))} yrs` : 'Not recorded'}</b></div>
-                      <div><span>Sex at birth</span><b>{patient.sexAtBirth ? patient.sexAtBirth.replaceAll('_', ' ') : 'Not recorded'}</b></div>
-                      <div><span>Preferred contact</span><b>{patient.preferredContactChannel || 'PHONE'}</b></div>
-                      <div><span>Preferred language</span><b>{patient.preferredLanguage || 'Not recorded'}</b></div>
-                      <div><span>Assigned clinician</span><b>{patient.assignedClinicianName || (patient.assignedClinicianId ? 'Assigned (name unavailable)' : 'Not assigned')}</b></div>
-                      {patient.contactProfileLastUpdatedAt && <div><span>Contact details last updated</span><b>{new Date(patient.contactProfileLastUpdatedAt).toLocaleString()}</b></div>}
-                    </div>
-                    {(coordinator || admin) && !contactEditOpen && <div className="patient360-profile-actions"><button type="button" className="secondary" onClick={openContactEditor}>Edit contact details</button></div>}
-                    {contactEditOpen && (coordinator || admin) && <form className="patient360-vitals-form patient360-contact-form" onSubmit={handleContactProfileSubmit}>
-                      <div className="section-head"><div><h3>Update contact details</h3><p className="muted">Updates are saved to the existing patient record and scoped to this clinic.</p></div></div>
-                      <div className="patient360-form-grid">
-                        <label>Phone *<input type="tel" autoComplete="tel" required minLength={7} maxLength={25} value={contactForm.phone} onChange={(event) => setContactForm((current) => ({ ...current, phone: event.target.value }))} placeholder="Patient phone number" /></label>
-                        <label>WhatsApp<input type="tel" autoComplete="tel" maxLength={25} value={contactForm.whatsapp} onChange={(event) => setContactForm((current) => ({ ...current, whatsapp: event.target.value }))} placeholder="Leave blank if unavailable" /></label>
-                        <label>Preferred language<input maxLength={20} value={contactForm.preferredLanguage} onChange={(event) => setContactForm((current) => ({ ...current, preferredLanguage: event.target.value }))} placeholder="e.g. ml, en" /></label>
-                        <label>Preferred contact channel<select value={contactForm.preferredContactChannel} onChange={(event) => setContactForm((current) => ({ ...current, preferredContactChannel: event.target.value as typeof current.preferredContactChannel }))}><option value="PHONE">Phone call</option><option value="SMS">SMS</option><option value="WHATSAPP">WhatsApp</option><option value="APP">App notification</option></select></label>
-                      </div>
-                      <div className="patient360-form-footer"><span className="muted">Changing the phone does not send a message automatically.</span><div className="toolbar"><button type="button" className="secondary" disabled={contactSaving} onClick={() => setContactEditOpen(false)}>Cancel</button><button type="submit" className="primary" disabled={contactSaving}>{contactSaving ? 'Saving…' : 'Save contact details'}</button></div></div>
-                    </form>}
-                    <p className="patient360-readonly-hint">Diagnosis, enrolment status and clinician assignment remain outside this contact-edit form.</p>
-                  </section>
-
-                  <section className="card glass">
-                    <div className="section-head"><div><div className="eyebrow">Longitudinal record</div><h2>Diagnoses and conditions</h2></div><Activity size={18} /></div>
-                    {diagnosesList.length ? diagnosesList.map((item) => <div className="patient360-diagnosis-row" key={item._id}>
-                      <div><b>{item.condition.replaceAll('_', ' ')}</b><span>Diagnosed {item.diagnosedAt ? new Date(item.diagnosedAt).toLocaleDateString() : 'date not recorded'}{item.source ? ` · ${item.source.replaceAll('_', ' ')}` : ''}</span></div>
-                      <Badge s={item.status} />
-                    </div>) : currentConditions.length ? (patient.conditions || []).filter((condition) => condition.status !== 'INACTIVE').map((condition) => <div className="patient360-diagnosis-row" key={condition.code}>
-                      <div><b>{condition.code.replaceAll('_', ' ')}</b><span>Patient summary · diagnosed {condition.diagnosedAt ? new Date(condition.diagnosedAt).toLocaleDateString() : 'date not recorded'}</span></div><Badge s={condition.status} />
-                    </div>) : <div className="empty-state compact">No structured diagnosis records were returned. Refresh or ask the assigned clinician to confirm the diagnosis.</div>}
-                  </section>
-
                   {clinician && clinicalSummary && (
                     <section className="card glass">
                       {/* <div className="section-head">
@@ -1214,6 +860,53 @@ async function handleEnrollmentCompleted() {
                       <ClinicalProgressSummary
   summary={clinicalSummary}
 />
+                    </section>
+                  )}
+
+                  {clinician && (
+                    <section className="card glass patient360-general-history">
+                      <div className="section-head patient360-general-history-heading">
+                        <div>
+                          <div className="eyebrow">ApexCare coordinator intake</div>
+                          <h2>General medical history</h2>
+                          <span className="muted">Patient-reported information · read-only clinical reference</span>
+                        </div>
+                        <div className="patient360-general-history-badge"><FileText size={17} /><span>{generalHistory ? 'RECORDED' : 'HISTORY'}</span></div>
+                      </div>
+
+                      {generalHistoryLoading ? (
+                        <div className="empty-state compact"><span className="loading-orb" /><b>Loading recorded history…</b></div>
+                      ) : generalHistoryError ? (
+                        <div className="alert alert-error" role="alert"><span>{generalHistoryError}</span><button type="button" className="secondary" onClick={() => void refreshClinicalData()}>Retry</button></div>
+                      ) : !generalHistory ? (
+                        <div className="empty-state compact"><FileText size={20} /><b>No coordinator-recorded history yet</b><span>Once the ApexCare coordinator records the baseline, it will appear here. Drafts are not shown in the clinical snapshot.</span></div>
+                      ) : (
+                        <>
+                          <div className="patient360-general-history-meta">
+                            <span><b>Recorded:</b> {generalHistory.recordedAt ? new Date(generalHistory.recordedAt).toLocaleString() : 'Date not available'}</span>
+                            <span><b>Collected by:</b> {generalHistory.collectedByName || 'ApexCare coordinator'}</span>
+                          </div>
+                          <div className="patient360-general-history-sections">
+                            {APEX_GENERAL_HISTORY_SECTIONS.map((historySection) => {
+                              const answers = generalHistory.answers.filter((answer: ApexCareGeneralHistoryAnswer) => answer.section === historySection.id);
+                              if (!answers.length) return null;
+                              return (
+                                <section className="patient360-general-history-section" key={historySection.id}>
+                                  <h3>{historySection.title}</h3>
+                                  {answers.map((answer) => (
+                                    <article className="patient360-general-history-answer" key={answer.questionId}>
+                                      <div><b>{answer.question}</b><span className={`badge ${answer.answer === 'YES' ? 'warn' : answer.answer === 'NO' ? 'success' : 'blue'}`}>{answer.answer.replaceAll('_', ' ')}</span></div>
+                                      {answer.details && <p>{answer.details}</p>}
+                                    </article>
+                                  ))}
+                                </section>
+                              );
+                            })}
+                          </div>
+                          {generalHistory.notes && <div className="patient360-general-history-notes"><b>Coordinator notes</b><p>{generalHistory.notes}</p></div>}
+                          <p className="patient360-general-history-disclaimer">This is a record of information reported to the ApexCare coordinator. It is not a diagnosis, clinical verification or treatment recommendation.</p>
+                        </>
+                      )}
                     </section>
                   )}
 
@@ -1271,7 +964,25 @@ async function handleEnrollmentCompleted() {
                         </div>
                       )}
 
+                      {diagnosis && (
+                        <div className="timeline-item">
+                          <div className="timeline-icon">
+                            <Activity size={16} />
+                          </div>
 
+                          <div>
+                            <b>Hypertension diagnosis</b>
+
+                            <p>{diagnosis.status}</p>
+
+                            <span>
+                              {new Date(
+                                diagnosis.diagnosedAt,
+                              ).toLocaleDateString()}
+                            </span>
+                          </div>
+                        </div>
+                      )}
                     </div>
                   </section>
                 </div>
@@ -1444,36 +1155,35 @@ async function handleEnrollmentCompleted() {
 
                       const status = String(draft.status || "UNKNOWN");
 
-                      const plan = draft.plan as
-                        | {
-                            goals?: Array<{
-                              title: string;
-                              target?: string;
-                            }>;
-                          }
-                        | undefined;
+                      const plan = draft.plan as DraftPlanView | undefined;
+                      const editing = editingDraftId === id;
+                      const viewPlan = editing ? draftEdits[id] || plan : plan;
 
                       return (
                         <div className="draft-card" key={id}>
                           <div className="section-head">
-                            <b>Draft {index + 1}</b>
+                            <div><b>Hypertension care plan · 90 days</b><div className="muted">Version {Number(draft.version || 1)} · {String(draft.source || 'RULES')} draft · clinician approval required</div></div>
 
                             <Badge s={status} />
                           </div>
 
-                          {plan?.goals?.map((goal) => (
-                            <div className="mini-item" key={goal.title}>
-                              <b>{goal.title}</b>
+                          {Boolean(draft.inputSnapshot) && <div className="mini-item"><b>Source data & verification</b><span>Review all values against the record. Unknown values remain unknown. {(() => { const completeness = (draft.inputSnapshot as { dataCompleteness?: { score?: number; missing?: string[] } }).dataCompleteness; return `Completeness ${completeness?.score ?? '—'}% · Missing: ${(completeness?.missing || ['not provided']).join(', ')}`; })()}</span></div>}
 
-                              <span>{goal.target || ""}</span>
-                            </div>
-                          ))}
+                          <label className="draft-plan-field"><b>Plan summary</b>{editing ? <textarea value={viewPlan?.summary || ''} onChange={(event) => setDraftEdits((current) => ({ ...current, [id]: { ...viewPlan!, summary: event.target.value } }))} rows={3} /> : <p>{viewPlan?.summary || 'Summary not provided.'}</p>}</label>
+
+                          <div className="draft-plan-section"><b>Care goals</b>{viewPlan?.goals?.map((goal, goalIndex) => <div className="draft-plan-row" key={`${goal.title}-${goalIndex}`}>{editing ? <><input aria-label="Goal title" value={goal.title} onChange={(event) => setDraftEdits((current) => { const next = { ...viewPlan! }; next.goals = [...next.goals]; next.goals[goalIndex] = { ...goal, title: event.target.value }; return { ...current, [id]: next }; })} /><input aria-label="Goal target" value={goal.target || ''} placeholder="Target / schedule" onChange={(event) => setDraftEdits((current) => { const next = { ...viewPlan! }; next.goals = [...next.goals]; next.goals[goalIndex] = { ...goal, target: event.target.value }; return { ...current, [id]: next }; })} /></> : <><strong>{goal.title}</strong><span>{goal.target || 'Target to be confirmed'}</span>{goal.rationale && <small>{goal.rationale}</small>}</>}</div>)}</div>
+
+                          <div className="draft-plan-section"><b>90-day tasks</b>{viewPlan?.tasks?.map((task, taskIndex) => <div className="draft-plan-row" key={`${task.title}-${taskIndex}`}>{editing ? <><input aria-label="Task title" value={task.title} onChange={(event) => setDraftEdits((current) => { const next = { ...viewPlan! }; next.tasks = [...next.tasks]; next.tasks[taskIndex] = { ...task, title: event.target.value }; return { ...current, [id]: next }; })} /><label>Day <input aria-label="Due day" type="number" min="0" max="90" value={task.dueDay} onChange={(event) => setDraftEdits((current) => { const next = { ...viewPlan! }; next.tasks = [...next.tasks]; next.tasks[taskIndex] = { ...task, dueDay: Number(event.target.value) }; return { ...current, [id]: next }; })} /></label></> : <><strong>Day {task.dueDay} · {task.title}</strong><span>{task.type.replaceAll('_', ' ')}</span>{task.rationale && <small>{task.rationale}</small>}</>}</div>)}</div>
+
+                          <div className="mini-item"><b>Clinical review flag</b><span>{viewPlan?.clinicalInterventionNeeded ? 'Clinician attention requested' : 'No additional flag recorded'} · AI confidence {Math.round((viewPlan?.confidence || 0) * 100)}% (not a clinical certainty score)</span></div>
+                          <div className="mini-item"><b>Safety and verification notes</b><span>{viewPlan?.safetyNotes?.join(' · ') || 'No safety notes provided.'}</span></div>
 
                           {(status === "GENERATED" || status === "CLINICIAN_REVIEW") && (
                             <div className="toolbar">
+                              {editing ? <><button className="secondary" disabled={busy} onClick={() => void saveDraftEdit(id)}>Save edits</button><button className="secondary" disabled={busy} onClick={() => setEditingDraftId(null)}>Cancel</button></> : <button className="secondary" disabled={busy} onClick={() => plan && startDraftEdit(id, plan)}>Edit draft</button>}
                               <button
                                 className="secondary"
-                                disabled={busy}
+                                disabled={busy || editing}
                                 onClick={() => reject(id)}
                               >
                                 <X size={14} />
@@ -1482,7 +1192,7 @@ async function handleEnrollmentCompleted() {
 
                               <button
                                 className="primary"
-                                disabled={busy}
+                                disabled={busy || editing}
                                 onClick={() => approve(id)}
                               >
                                 <Check size={14} />
@@ -1505,23 +1215,6 @@ async function handleEnrollmentCompleted() {
             {section === "vitals" && (
               <div className="patient360-grid">
                 <section className="card glass">
-                  <div className="section-head"><div><div className="eyebrow">New measurement</div><h2>Record patient vitals</h2><p className="muted">Saved to the patient record with the current timestamp and selected source.</p></div><HeartPulse size={19} color="#1677ff" /></div>
-                  <form className="patient360-vitals-form" onSubmit={handleVitalsSubmit}>
-                    <label>Reading source<select value={vitalsForm.source} onChange={(event) => setVitalsForm((current) => ({ ...current, source: event.target.value as 'OPD' | 'HOME' | 'DEVICE' }))}><option value="OPD">Clinic / OPD</option><option value="HOME">Reported from home</option><option value="DEVICE">Device</option></select></label>
-                    <div className="patient360-form-grid">
-                      <label>Systolic BP (mmHg)<input inputMode="decimal" type="number" min="40" max="300" value={vitalsForm.systolic} onChange={(event) => setVitalsForm((current) => ({ ...current, systolic: event.target.value }))} placeholder="e.g. 130" /></label>
-                      <label>Diastolic BP (mmHg)<input inputMode="decimal" type="number" min="20" max="200" value={vitalsForm.diastolic} onChange={(event) => setVitalsForm((current) => ({ ...current, diastolic: event.target.value }))} placeholder="e.g. 80" /></label>
-                      <label>Pulse (bpm)<input inputMode="decimal" type="number" min="20" max="250" value={vitalsForm.pulse} onChange={(event) => setVitalsForm((current) => ({ ...current, pulse: event.target.value }))} placeholder="Optional" /></label>
-                      <label>Weight (kg)<input inputMode="decimal" type="number" min="1" max="500" step="0.1" value={vitalsForm.weightKg} onChange={(event) => setVitalsForm((current) => ({ ...current, weightKg: event.target.value }))} placeholder="Optional" /></label>
-                      <label>Blood glucose (mg/dL)<input inputMode="decimal" type="number" min="10" max="1000" step="0.1" value={vitalsForm.bloodSugar} onChange={(event) => setVitalsForm((current) => ({ ...current, bloodSugar: event.target.value }))} placeholder="Optional" /></label>
-                      <label>Glucose type<select value={vitalsForm.bloodSugarType} onChange={(event) => setVitalsForm((current) => ({ ...current, bloodSugarType: event.target.value as typeof current.bloodSugarType }))}><option value="FASTING">Fasting</option><option value="POST_PRANDIAL">Post-prandial</option><option value="RANDOM">Random</option></select></label>
-                    </div>
-                    <label>Symptoms / concerns<textarea maxLength={2000} rows={2} value={vitalsForm.symptoms} onChange={(event) => setVitalsForm((current) => ({ ...current, symptoms: event.target.value }))} placeholder="Optional; separate multiple items with commas or new lines" /></label>
-                    <label>Measurement notes<textarea maxLength={2000} rows={2} value={vitalsForm.notes} onChange={(event) => setVitalsForm((current) => ({ ...current, notes: event.target.value }))} placeholder="Optional context for the clinical team" /></label>
-                    <div className="patient360-form-footer"><span className="muted">A record is saved only when you submit this form.</span><button type="submit" className="primary" disabled={vitalsBusy}>{vitalsBusy ? <><RefreshCw size={14} className="spin" /> Saving…</> : <><Check size={14} /> Save vitals</>}</button></div>
-                  </form>
-                </section>
-                <section className="card glass">
                   <div className="section-head">
                     <div>
                       <div className="eyebrow">Longitudinal monitoring</div>
@@ -1533,7 +1226,7 @@ async function handleEnrollmentCompleted() {
                   </div>
 
                   <div className="chart">
-                    {bloodPressureVitals
+                    {vitals
                       .slice(0, 10)
                       .reverse()
                       .map((item) => {
@@ -1559,7 +1252,6 @@ async function handleEnrollmentCompleted() {
                           </div>
                         );
                       })}
-                    {!bloodPressureVitals.length && <div className="empty-state compact">No blood-pressure measurements available to chart.</div>}
                   </div>
                 </section>
 
@@ -1576,20 +1268,19 @@ async function handleEnrollmentCompleted() {
                         <b>
                           {item.bloodPressure
                             ? `${item.bloodPressure.systolic}/${item.bloodPressure.diastolic} mmHg`
-                            : item.bloodSugar
-                              ? `${item.bloodSugar.value} ${item.bloodSugar.unit === 'PERCENT' ? '%' : 'mg/dL'}`
-                              : item.weightKg ? `${item.weightKg} kg` : 'Recorded measurement'}
+                            : "No BP"}
                         </b>
-                        <span className="muted">{new Date(item.recordedAt).toLocaleString()}</span>
+
+                        <span className="muted">
+                          {new Date(item.recordedAt).toLocaleDateString()}
+                        </span>
                       </div>
+
                       <p>
-                        {item.source || 'Recorded'}
-                        {item.bloodPressure?.pulse ? ` · Pulse ${item.bloodPressure.pulse} bpm` : ''}
-                        {item.bloodSugar ? ` · ${item.bloodSugar.type.replaceAll('_', ' ')} glucose` : ''}
-                        {item.weightKg ? ` · ${item.weightKg} kg` : ''}
+                        {item.source || "Recorded"}
+
+                        {item.weightKg ? ` · ${item.weightKg} kg` : ""}
                       </p>
-                      {item.symptoms?.length ? <p>Symptoms: {item.symptoms.join(', ')}</p> : null}
-                      {item.notes ? <p className="muted">{item.notes}</p> : null}
                     </div>
                   ))}
 
@@ -1604,7 +1295,7 @@ async function handleEnrollmentCompleted() {
                 LABS + CLINICAL SIGNALS
                 ================================================= */}
 
-            {clinician && section === "labs" && (
+            {(clinician || coordinator) && section === "labs" && (
               <div className="patient360-grid">
                 <section className="card glass">
                   <div className="section-head">
@@ -1616,6 +1307,11 @@ async function handleEnrollmentCompleted() {
                       <RefreshCw size={16} className={clinicalActionBusy === 'refresh' ? 'spin' : ''} />
                     </button>
                   </div>
+
+                  {coordinator && <label className="secondary" style={{ display: 'inline-flex', alignItems: 'center', gap: 8, marginBottom: 16, cursor: labUploadBusy ? 'wait' : 'pointer' }}>
+                    {labUploadBusy ? 'Uploading…' : 'Upload lab PDF'}
+                    <input type="file" accept="application/pdf,.pdf" hidden disabled={labUploadBusy} onChange={(event) => { void handleLabUpload(event.target.files?.[0]); event.currentTarget.value = ''; }} />
+                  </label>}
 
                   {!labDocs.length && <div className="empty-state">No lab reports available yet.</div>}
                   {labDocs.map((doc) => {
@@ -1630,13 +1326,20 @@ async function handleEnrollmentCompleted() {
                           </div>
                           <Badge s={interpretation?.clinicianReviewStatus || doc.interpretationStatus || doc.structuringStatus} />
                         </div>
+                        <button className="secondary" type="button" onClick={() => void handleOpenLabFile(doc._id)}>Open original PDF</button>
+
+                        <p className="muted">Processing: {doc.processingStage || doc.extractionStatus || 'Queued'} · Attempts: {doc.processingAttempts ?? 0}</p>
+                        <p className="muted">OCR source: {doc.ocrEngine ? `${doc.ocrEngine}${doc.ocrEngineVersion ? ` ${doc.ocrEngineVersion}` : ''}` : 'Not available'}{doc.ocrWarningCode || doc.extractionWarningCode ? ` · ${doc.ocrWarningCode || doc.extractionWarningCode}` : ''}</p>
+                        {doc.extractionStatus === 'FAILED' && <button className="secondary" disabled={clinicalActionBusy === `lab-retry:${doc._id}`} onClick={() => void handleLabRetry(doc._id, 'OCR')}>Retry OCR</button>}
+                        {doc.extractionStatus === 'COMPLETED' && doc.structuringStatus === 'FAILED' && <button className="secondary" disabled={clinicalActionBusy === `lab-retry:${doc._id}`} onClick={() => void handleLabRetry(doc._id, 'AI_EXTRACTION')}>Retry AI extraction</button>}
 
                         {!!data?.results?.length && (
                           <div className="lab-result-grid">
                             {data.results.map((result) => (
                               <div className={`lab-result ${result.abnormalFlag !== 'NORMAL' ? 'abnormal' : ''}`} key={result._id}>
                                 <div><span>{result.testName}</span><b>{result.valueText}{result.unit ? ` ${result.unit}` : ''}</b></div>
-                                <small>{result.abnormalFlag !== 'NORMAL' ? result.abnormalFlag : result.referenceRangeText || 'Within reference range'}</small>
+                                <small>{result.abnormalFlag !== 'NORMAL' ? result.abnormalFlag : result.referenceRangeText || 'Within reference range'} · {result.reviewStatus || 'UNVERIFIED'}{result.sourcePage ? ` · page ${result.sourcePage}` : ''}</small>
+                                {result.sourceText && <small className="muted">Source: {result.sourceText}</small>}
                               </div>
                             ))}
                           </div>
@@ -1685,12 +1388,11 @@ async function handleEnrollmentCompleted() {
 
             {section === "medications" && (
               <section className="card glass">
-                <div className="section-head"><div><div className="eyebrow">Prescription workflow output</div><h2>Medication history</h2></div><Pill size={18} color="#1677ff" /></div>
-                <p className="muted">Verified medication records are shown with their current status. OCR candidates remain drafts until the clinical verification workflow is complete.</p>
-                {!medicationList.length && <div className="empty-state">No medication records are available.</div>}
-                {!!medicationList.filter((medication) => medication.status === 'ACTIVE').length && <h3 className="patient360-subheading">Active medicines</h3>}
+                <div className="section-head"><div><div className="eyebrow">Prescription workflow output</div><h2>Current medicines</h2></div><Pill size={18} color="#1677ff" /></div>
+                <p className="muted">Only verified medication records are shown here. Prescription analysis and clinical review remain governed by the backend workflow.</p>
+                {!medicationList.length && <div className="empty-state">No active medication records yet.</div>}
                 <div className="medication-grid">
-                  {medicationList.filter((medication) => medication.status === 'ACTIVE').map((medication) => (
+                  {medicationList.map((medication) => (
                     <div className="medication-card" key={medication._id}>
                       <div className="medication-icon"><Pill size={17}/></div>
                       <div><b>{medication.name}</b><span>{[medication.strength, medication.dose].filter(Boolean).join(' · ') || 'Dose not recorded'}</span><small>{medication.frequency || 'Frequency not recorded'}{medication.route ? ` · ${medication.route}` : ''}</small>{medication.instructions && <p>{medication.instructions}</p>}</div>
@@ -1698,18 +1400,6 @@ async function handleEnrollmentCompleted() {
                     </div>
                   ))}
                 </div>
-                {!!medicationList.filter((medication) => medication.status !== 'ACTIVE').length && <>
-                  <h3 className="patient360-subheading">Discontinued medicines</h3>
-                  <div className="medication-grid">
-                    {medicationList.filter((medication) => medication.status !== 'ACTIVE').map((medication) => (
-                      <div className="medication-card" key={medication._id}>
-                        <div className="medication-icon"><Pill size={17}/></div>
-                        <div><b>{medication.name}</b><span>{[medication.strength, medication.dose].filter(Boolean).join(' · ') || 'Dose not recorded'}</span><small>{medication.frequency || 'Frequency not recorded'}{medication.route ? ` · ${medication.route}` : ''}</small>{medication.discontinuedAt && <small>Discontinued {new Date(medication.discontinuedAt).toLocaleDateString()}</small>}</div>
-                        <Badge s={medication.status} />
-                      </div>
-                    ))}
-                  </div>
-                </>}
 
                 {coordinator && (
                   <>
@@ -1720,76 +1410,17 @@ async function handleEnrollmentCompleted() {
                       <span><b>{prescriptionUploadBusy ? 'Capturing prescription…' : 'Take prescription photo'}</b><small>Clear, well-lit image · JPG, PNG or WebP</small></span>
                     </label>
                     {prescriptionMessage && <div className="inline-feedback page-enter">{prescriptionMessage}</div>}
-                    {prescriptionOcrRuntimeStatus && !prescriptionOcrRuntimeStatus.configured && <div className="ocr-configuration-warning" role="status"><AlertTriangle size={17} /><div><b>Prescription recognition is not configured</b><span>The image can still be securely captured, but automated extraction will not run until the backend OCR endpoint or vision fallback is configured. Failed extraction must be handled through clinician review.</span></div></div>}
-                    {prescriptionOcrRuntimeStatus?.configured && <p className="muted ocr-runtime-note">Recognition provider configured: {prescriptionOcrRuntimeStatus.provider === 'paddleocr-vl' ? 'PaddleOCR-VL full layout-parsing pipeline' : prescriptionOcrRuntimeStatus.provider === 'openai-compatible' ? 'OpenAI-compatible vision endpoint' : 'OpenAI-compatible vision fallback'}. OCR output remains unverified until a clinician checks it against the original image.</p>}
-                    {prescriptionOcrRuntimeStatus?.configured && prescriptionOcrRuntimeStatus.provider === 'paddleocr-vl' && !prescriptionOcrRuntimeStatus.medicationStructuringConfigured && <div className="ocr-configuration-warning" role="status"><AlertTriangle size={17} /><div><b>Text recognition is configured; medication field extraction is not</b><span>PaddleOCR will return the recognized text, but a chat-completions-compatible text model must be configured with AI_ENABLED, AI_BASE_URL, AI_API_KEY, and AI_MODEL to structure it into medicine candidates. Do not use candidates without clinician verification.</span></div></div>}
                   </>
                 )}
                 {!prescriptions.length && <div className="empty-state">No prescription documents captured yet.</div>}
-                {prescriptions.map((document) => {
-                  const documentDrafts = prescriptionDrafts[document._id] || [];
-                  const isAnalyzing = document.analysisStatus === 'PENDING' || document.analysisStatus === 'PROCESSING' || document.status === 'ANALYZING';
-                  return (
-                    <div className="prescription-row" key={document._id}>
-                      <div className="service-icon"><FileText size={16}/></div>
-                      <div className="prescription-document-main">
-                        <b>{document.fileName || 'Prescription document'}</b>
-                        <span>{document.capturedAt ? new Date(document.capturedAt).toLocaleString() : 'Captured prescription'}</span>
-                        <small>{isAnalyzing ? 'OCR recognition is processing…' : document.analysisStatus || document.status || 'PENDING'}</small>
-                        {document.clinicalReviewReason && <p className="ocr-review-note">{document.clinicalReviewReason}</p>}
-                      </div>
-                      <div className="prescription-document-actions">
-                        <Badge s={isAnalyzing ? 'PENDING' : document.analysisStatus || document.status} />
-                        <button type="button" className="secondary" disabled={prescriptionImageBusyId === document._id} onClick={() => void togglePrescriptionImage(document._id)}>
-                          {prescriptionImageBusyId === document._id ? <><RefreshCw size={13} className="spin" /> Loading image…</> : prescriptionImageUrls[document._id] ? 'Hide original image' : 'View original image'}
-                        </button>
-                      </div>
-                      {prescriptionImageErrors[document._id] && <div className="inline-feedback" role="alert">{prescriptionImageErrors[document._id]}</div>}
-                      {prescriptionImageUrls[document._id] && <div className="prescription-original-image"><img src={prescriptionImageUrls[document._id]} alt={`Original prescription ${document.fileName || ''}`} /><p className="muted">Compare the original prescription image before verifying any extracted medication. The image remains in this browser session only.</p></div>}
-                      {isAnalyzing && <div className="ocr-progress-note"><RefreshCw size={14} className="spin" /> Recognition is running. This list refreshes automatically.</div>}
-                      {documentDrafts.length > 0 && <div className="ocr-draft-stack">
-                        {documentDrafts.slice(0, 2).map((draft) => {
-                          const initialMedications = draft.medications || [];
-                          const canEditMedicationCandidates = clinician && draft.status === 'VERIFICATION_REQUIRED' && document.analysisStatus === 'COMPLETED';
-                          const displayedMedications = canEditMedicationCandidates
-                            ? (editedDraftMedications[draft._id] ?? initialMedications)
-                            : initialMedications;
-                          return (
-                            <div className="ocr-draft-panel" key={draft._id}>
-                              <div className="ocr-draft-heading"><div><b>Recognition result</b><span>{displayedMedications.length} medication candidate{displayedMedications.length === 1 ? '' : 's'} · {draft.status || 'PENDING'}</span></div><Badge s={draft.status} /></div>
-                              {draft.clinicalReviewRequired && <p className="ocr-review-note"><AlertTriangle size={14} /> {draft.clinicalReviewReason || 'Clinician verification is required before use.'}</p>}
-                              {canEditMedicationCandidates && <p className="muted ocr-editor-guidance">Confirm the medicine names and directions against the original prescription image. Correct or add a candidate before submitting; editing removes the AI confidence label because the original extraction no longer exactly matches the edited row.</p>}
-                              {displayedMedications.length ? <div className="ocr-medication-list">
-                                {displayedMedications.map((medication, index) => (
-                                  <div className={`ocr-medication-candidate${canEditMedicationCandidates ? ' ocr-medication-editor-item' : ''}`} key={`${draft._id}-${index}`}>
-                                    {canEditMedicationCandidates ? <>
-                                      <label className="ocr-editor-field ocr-editor-name"><span>Medicine name *</span><input maxLength={160} value={medication.name} onChange={(event) => updateDraftMedicationField(draft._id, initialMedications, index, 'name', event.target.value)} placeholder="Medicine name from prescription" /></label>
-                                      <div className="ocr-editor-fields">
-                                        <label className="ocr-editor-field"><span>Strength</span><input maxLength={80} value={medication.strength || ''} onChange={(event) => updateDraftMedicationField(draft._id, initialMedications, index, 'strength', event.target.value)} placeholder="e.g. 5 mg" /></label>
-                                        <label className="ocr-editor-field"><span>Dose</span><input maxLength={80} value={medication.dose || ''} onChange={(event) => updateDraftMedicationField(draft._id, initialMedications, index, 'dose', event.target.value)} placeholder="e.g. 1 tablet" /></label>
-                                        <label className="ocr-editor-field"><span>Route</span><input maxLength={40} value={medication.route || ''} onChange={(event) => updateDraftMedicationField(draft._id, initialMedications, index, 'route', event.target.value)} placeholder="e.g. oral" /></label>
-                                        <label className="ocr-editor-field"><span>Frequency</span><input maxLength={80} value={medication.frequency || ''} onChange={(event) => updateDraftMedicationField(draft._id, initialMedications, index, 'frequency', event.target.value)} placeholder="As written" /></label>
-                                        <label className="ocr-editor-field"><span>Duration</span><input maxLength={80} value={medication.duration || ''} onChange={(event) => updateDraftMedicationField(draft._id, initialMedications, index, 'duration', event.target.value)} placeholder="As written" /></label>
-                                        <label className="ocr-editor-field ocr-editor-instructions"><span>Instructions</span><input maxLength={500} value={medication.instructions || ''} onChange={(event) => updateDraftMedicationField(draft._id, initialMedications, index, 'instructions', event.target.value)} placeholder="Additional instructions" /></label>
-                                      </div>
-                                      <div className="ocr-editor-row-actions"><span className="muted">Candidate {index + 1}</span><button className="secondary" type="button" onClick={() => removeDraftMedication(draft._id, initialMedications, index)}>Remove medicine</button></div>
-                                    </> : <>
-                                      <div className="ocr-medication-candidate-main"><b>{medication.name}</b><span>{[medication.strength, medication.dose, medication.route, medication.frequency, medication.duration].filter(Boolean).join(' · ') || 'Dose/instructions not extracted'}</span>{medication.instructions && <small>{medication.instructions}</small>}{medication.sourceText && <small>Source: “{medication.sourceText}”</small>}</div>
-                                      {typeof medication.confidence === 'number' && <span className={`badge ${medication.confidence >= 0.8 ? 'success' : 'warn'}`}>{Math.round(medication.confidence * 100)}% confidence</span>}
-                                    </>}
-                                  </div>
-                                ))}
-                              </div> : <div className="empty-state compact">No medication candidates were safely extracted. The clinician can enter a candidate from the original image and OCR transcription.</div>}
-                              {draft.rawText && <details className="ocr-raw-text"><summary>View extracted prescription text</summary><pre>{draft.rawText}</pre></details>}
-                              {canEditMedicationCandidates && <div className="ocr-actions"><button className="secondary" type="button" onClick={() => addDraftMedication(draft._id, initialMedications)}>Add medicine</button><button className="primary" disabled={clinicalActionBusy === `draft:${draft._id}`} onClick={() => void handleDraftSubmit(document._id, draft)}>{clinicalActionBusy === `draft:${draft._id}` ? 'Submitting…' : 'Submit for verification'}</button></div>}
-                              {clinician && draft.status === 'VERIFIED' && !draft.clinicalReviewRequired && document.status === 'VERIFIED' && <div className="ocr-actions"><button className="primary" disabled={clinicalActionBusy === `finalize:${draft._id}`} onClick={() => void handleDraftFinalize(document._id, draft)}>{clinicalActionBusy === `finalize:${draft._id}` ? 'Finalizing…' : 'Finalize medicines'}</button></div>}
-                            </div>
-                          );
-                        })}
-                      </div>}
-                    </div>
-                  );
-                })}
+                {prescriptions.map((document) => (
+                  <div className="prescription-row" key={document._id}>
+                    <div className="service-icon"><FileText size={16}/></div>
+                    <div><b>{document.fileName || 'Prescription document'}</b><span>{document.capturedAt ? new Date(document.capturedAt).toLocaleString() : 'Captured prescription'}</span><small>{document.analysisStatus || document.status || 'PENDING'}{document.clinicalReviewReason ? ` · ${document.clinicalReviewReason}` : ''}</small></div>
+                    <Badge s={document.analysisStatus || document.status} />
+                    {prescriptionDrafts[document._id]?.length ? <div className="draft-summary">{prescriptionDrafts[document._id].slice(0,2).map((draft) => <div className="draft-action" key={draft._id}><span>{draft.medications?.length || 0} medication candidate{draft.medications?.length === 1 ? '' : 's'} · {draft.status || 'PENDING'}</span>{draft.status === 'VERIFICATION_REQUIRED' && coordinator && <button className="secondary" disabled={clinicalActionBusy === `draft:${draft._id}`} onClick={() => void handleDraftSubmit(document._id, draft)}>{clinicalActionBusy === `draft:${draft._id}` ? 'Submitting…' : 'Submit for verification'}</button>}{draft.status === 'VERIFIED' && (coordinator || clinician) && <button className="primary" disabled={clinicalActionBusy === `finalize:${draft._id}`} onClick={() => void handleDraftFinalize(document._id, draft)}>{clinicalActionBusy === `finalize:${draft._id}` ? 'Finalizing…' : 'Finalize medicines'}</button>}</div>)}</div> : null}
+                  </div>
+                ))}
               </section>
             )}
 
@@ -1798,23 +1429,6 @@ async function handleEnrollmentCompleted() {
                 ================================================= */}
 
             {section === "opd" && (
-              <div className="patient360-opd-stack">
-              {clinician && (
-                <section className="card glass">
-                  <div className="section-head"><div><div className="eyebrow">Clinician documentation</div><h2>Record an OPD visit</h2><p className="muted">This creates a clinician-authored visit record. It does not replace clinic-arrival/check-in.</p></div><Stethoscope size={18} /></div>
-                  {String(patient.assignedClinicianId || '') !== roles.userId ? (
-                    <div className="patient360-readonly-note" role="status">This patient is not assigned to your clinician account. The backend only permits the assigned clinician to create an OPD visit.</div>
-                  ) : (
-                    <form className="patient360-vitals-form" onSubmit={handleOpdSubmit}>
-                      <label>Reason for visit *<input required maxLength={500} value={opdForm.reason} onChange={(event) => setOpdForm((current) => ({ ...current, reason: event.target.value }))} placeholder="e.g. Day 30 hypertension follow-up" /></label>
-                      <label>Clinical assessment<textarea maxLength={5000} rows={3} value={opdForm.assessment} onChange={(event) => setOpdForm((current) => ({ ...current, assessment: event.target.value }))} placeholder="Clinician assessment and relevant findings" /></label>
-                      <label>Plan adjustment / next action<textarea maxLength={5000} rows={3} value={opdForm.planAdjustment} onChange={(event) => setOpdForm((current) => ({ ...current, planAdjustment: event.target.value }))} placeholder="Document clinician-approved adjustment or follow-up" /></label>
-                      <label>Link saved vitals (optional)<select value={opdForm.vitalsRecordId} onChange={(event) => setOpdForm((current) => ({ ...current, vitalsRecordId: event.target.value }))}><option value="">No vitals linked</option>{vitals.slice(0, 8).map((vital) => <option key={vital._id} value={vital._id}>{new Date(vital.recordedAt).toLocaleString()} · {vital.bloodPressure ? `${vital.bloodPressure.systolic}/${vital.bloodPressure.diastolic} mmHg` : vital.bloodSugar ? `${vital.bloodSugar.value} ${vital.bloodSugar.unit}` : vital.weightKg ? `${vital.weightKg} kg` : 'Measurement'}</option>)}</select></label>
-                      <div className="patient360-form-footer"><span className="muted">Only the assigned clinician can submit this visit.</span><button type="submit" className="primary" disabled={opdBusy}>{opdBusy ? <><RefreshCw size={14} className="spin" /> Saving…</> : <><Check size={14} /> Save OPD visit</>}</button></div>
-                    </form>
-                  )}
-                </section>
-              )}
               <section className="card glass">
                 <div className="section-head">
                   <div>
@@ -1842,7 +1456,7 @@ async function handleEnrollmentCompleted() {
                           </span>
                         </div>
 
-                        <p>{visit.assessment || visit.notes || "No assessment recorded."}</p>{visit.planAdjustment && <p><b>Plan / next action:</b> {visit.planAdjustment}</p>}
+                        <p>{visit.notes || "No visit notes recorded."}</p>
                       </div>
                     </div>
                   ))}
@@ -1852,7 +1466,6 @@ async function handleEnrollmentCompleted() {
                   <div className="empty-state">No OPD visits recorded.</div>
                 )}
               </section>
-              </div>
             )}
 
             {/* =================================================

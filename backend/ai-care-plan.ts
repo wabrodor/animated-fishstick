@@ -1,5 +1,5 @@
 import { attachCarePlanTasksToExecution, ensureCarePlanExecution } from './care-plan-execution.js';
-import { ApexCareEnrollment, CarePlan, CarePlanDraft, Patient, VitalRecord, CareTask, OpdVisit, Diagnosis, DietitianAssessment, ProgramConsent } from './models.js';
+import { ApexCareEnrollment, ApexCareGeneralHistory, CarePlan, CarePlanDraft, Patient, VitalRecord, CareTask, OpdVisit, Diagnosis, DietitianAssessment, ProgramConsent } from './models.js';
 import { env } from './config.js';
 
 const PLAN_DAYS = 90;
@@ -15,6 +15,7 @@ export type HypertensionCarePlanDraft = {
 
 type PatientSnapshot = {
   dietitianRemarks: string | null;
+  coordinatorHistory: string | null;
   ageYears: number | null;
   sexAtBirth: string | null;
   hypertensionStatus: string;
@@ -47,22 +48,22 @@ export async function generateHypertensionCarePlanDraft(
     clinicOrganizationId,
     apexcareOrganizationId,
     status: 'ACTIVE',
-    coordinatorCallStatus: 'CONTACTED',
-    dietitianAssessmentStatus: 'COMPLETED',
+    generalHistoryStatus: 'RECORDED',
   }).lean();
   if (!enrollment) return { error: 'CARE_PLAN_GENERATION_CONTEXT_INVALID' as const };
 
-  const [diagnosis, consent, vitals, tasks, visits, dietitianAssessment] = await Promise.all([
+  const [diagnosis, consent, vitals, tasks, visits, dietitianAssessment, generalHistory] = await Promise.all([
     Diagnosis.findOne({ organizationId: clinicOrganizationId, patientId, condition: 'HYPERTENSION', status: 'CONFIRMED' }).sort({ diagnosedAt: -1 }).lean(),
-    ProgramConsent.findOne({ organizationId: clinicOrganizationId, patientId, program: 'APEXCARE_CHRONIC_CARE', consentGiven: true }).sort({ consentAt: -1 }).lean(),
+    ProgramConsent.findOne({ organizationId: clinicOrganizationId, patientId, program: 'APEXCARE_CHRONIC_CARE' }).sort({ consentAt: -1 }).lean(),
     VitalRecord.find({ organizationId: clinicOrganizationId, patientId }).sort({ recordedAt: -1 }).limit(10).lean(),
     CareTask.find({ organizationId: clinicOrganizationId, patientId }).lean(),
     OpdVisit.find({ organizationId: clinicOrganizationId, patientId }).sort({ visitAt: -1 }).limit(5).lean(),
     DietitianAssessment.findOne({ _id: assessmentId, apexCareEnrollmentId: enrollment._id, patientId, clinicOrganizationId, apexcareOrganizationId }).lean(),
+    ApexCareGeneralHistory.findOne({ _id: assessmentId, enrollmentId: enrollment._id, patientId, clinicOrganizationId, apexcareOrganizationId, status: 'RECORDED' }).lean(),
   ]);
   if (!diagnosis) return { error: 'CONFIRMED_DIAGNOSIS_REQUIRED' as const };
-  if (!consent) return { error: 'PROGRAM_CONSENT_REQUIRED' as const };
-  if (!dietitianAssessment) return { error: 'DIETITIAN_ASSESSMENT_REQUIRED' as const };
+  if (!consent?.consentGiven || consent.withdrawnAt) return { error: 'PROGRAM_CONSENT_REQUIRED' as const };
+  if (!dietitianAssessment && !generalHistory) return { error: 'RECORDED_HISTORY_REQUIRED' as const };
 
   const bp = vitals.filter((v) => v.bloodPressure).map((v) => ({
     systolic: v.bloodPressure!.systolic,
@@ -75,20 +76,22 @@ export async function generateHypertensionCarePlanDraft(
   const completed = tasks.filter((task) => task.status === 'COMPLETED').length;
   const overdue = tasks.filter((task) => task.status === 'OVERDUE' || (task.status === 'PENDING' && task.dueAt < new Date())).length;
   const completionRate = tasks.length ? Math.round((completed / tasks.length) * 100) : 0;
-  const ageYears = patient.dateOfBirth ? Math.max(0, Math.floor((Date.now() - patient.dateOfBirth.getTime()) / (365.25 * 24 * 60 * 60 * 1000))) : null;
+  const ageYears = typeof patient.ageAtRegistration === 'number' ? patient.ageAtRegistration : patient.dateOfBirth ? Math.max(0, Math.floor((Date.now() - patient.dateOfBirth.getTime()) / (365.25 * 24 * 60 * 60 * 1000))) : null;
 
   const known: string[] = ['diagnosis'];
   const missing: string[] = [];
-  if (patient.dateOfBirth) known.push('age'); else missing.push('age');
+  if (ageYears !== null) known.push('age'); else missing.push('age');
   if (patient.sexAtBirth && patient.sexAtBirth !== 'NOT_RECORDED') known.push('sex'); else missing.push('sex');
   if (bp.length) known.push('bloodPressure'); else missing.push('bloodPressureTrend');
   if (latestWeightKg !== null) known.push('weight'); else missing.push('weight');
   if (visits.length) known.push('opdHistory'); else missing.push('opdHistory');
-  missing.push('medicationAdherence', 'laboratoryResults', 'lifestyleHistory');
+  if (generalHistory) known.push('coordinatorGeneralHistory'); else missing.push('lifestyleHistory');
+  missing.push('medicationAdherence', 'laboratoryResults');
   const completenessScore = Math.round((known.length / (known.length + missing.length)) * 100);
 
   const snapshot: PatientSnapshot = {
-    dietitianRemarks: dietitianAssessment.remarks,
+    dietitianRemarks: dietitianAssessment?.remarks ?? null,
+    coordinatorHistory: generalHistory ? JSON.stringify({ answers: generalHistory.answers.map(({ question, answer, details }) => ({ question, answer, details })), notes: generalHistory.notes ?? null }) : null,
     ageYears,
     sexAtBirth: patient.sexAtBirth ?? null,
     hypertensionStatus: patient.conditions.find((condition) => condition.code === 'HYPERTENSION')?.status ?? 'UNKNOWN',

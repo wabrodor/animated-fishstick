@@ -35,6 +35,7 @@ let ApexCareEnrollment: typeof import('../models.js')['ApexCareEnrollment'];
 let DietitianAssessment: typeof import('../models.js')['DietitianAssessment'];
 let ApexCareReferral: typeof import('../models.js')['ApexCareReferral'];
 let PrescriptionDocument: typeof import('../models.js')['PrescriptionDocument'];
+let LabDocument: typeof import('../models.js')['LabDocument'];
 let MedicationDraft: typeof import('../models.js')['MedicationDraft'];
 let MedicationRecord: typeof import('../models.js')['MedicationRecord'];
 let MedicationHistory: typeof import('../models.js')['MedicationHistory'];
@@ -112,6 +113,7 @@ beforeAll(async () => {
     DietitianAssessment,
     ApexCareReferral,
     PrescriptionDocument,
+    LabDocument,
     MedicationDraft,
     MedicationRecord,
     MedicationHistory,
@@ -146,6 +148,7 @@ beforeEach(async () => {
     DietitianAssessment.deleteMany({}),
     ApexCareReferral.deleteMany({}),
     PrescriptionDocument.deleteMany({}),
+    LabDocument.deleteMany({}),
     MedicationDraft.deleteMany({}),
     MedicationRecord.deleteMany({}),
     MedicationHistory.deleteMany({}),
@@ -458,6 +461,32 @@ beforeEach(async () => {
  */
 
 describe('security boundaries', () => {
+  it('blocks a clinic coordinator from fetching another clinic lab source file', async () => {
+    const foreignPatient = await Patient.findById(patientBId).lean();
+    expect(foreignPatient).toBeTruthy();
+    const document = await LabDocument.create({
+      patientId: patientBId,
+      clinicOrganizationId: organizationBId,
+      apexcareOrganizationId,
+      source: 'LAB_PDF',
+      fileName: 'report.pdf',
+      mimeType: 'application/pdf',
+      storageKey: 'labs/not-a-real-object.pdf',
+      storageProvider: 'local',
+      sizeBytes: 8,
+      sha256: 'a'.repeat(64),
+      idempotencyKey: `foreign-${Date.now()}`,
+      uploadedByUserId: clinicianCId,
+    });
+
+    const response = await request(app)
+      .get(`/api/v1/patients/${patientBId}/lab-documents/${String(document._id)}/file`)
+      .set('Authorization', `Bearer ${coordinatorToken}`);
+
+    expect(response.status).toBe(404);
+    expect(response.body.error.code).toBe('PATIENT_NOT_FOUND');
+  });
+
   /*
    * ----------------------------------------------------------
    * EXISTING CLINIC-LEVEL TESTS

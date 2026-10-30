@@ -2,8 +2,9 @@ import { inflateSync, inflateRawSync } from 'node:zlib';
 import { LabDocument } from './models.js';
 import { enqueueOutboxEvent } from './outbox.js';
 import { readLabPdf } from './storage.js';
+import { runMedicalDocumentOcr } from './medical-document-ocr.js';
 
-export const LAB_PDF_EXTRACTION_VERSION = 1;
+export const LAB_PDF_EXTRACTION_VERSION = 2;
 const PROCESSING_LEASE_MS = 10 * 60 * 1000;
 const MAX_EXTRACTED_TEXT = 100_000;
 
@@ -113,11 +114,13 @@ export function extractPdfText(buffer: Buffer): string {
   return text.slice(0, MAX_EXTRACTED_TEXT);
 }
 
-export async function claimLabDocumentExtraction(documentId: string, now = new Date()) {
+export async function claimLabDocumentExtraction(documentId: string, now = new Date(), processingVersion = 1) {
   const staleBefore = new Date(now.getTime() - PROCESSING_LEASE_MS);
+  const generationFilter = processingVersion === 1 ? { $or: [{ processingVersion: 1 }, { processingVersion: { $exists: false } }] } : { processingVersion };
   return LabDocument.findOneAndUpdate(
     {
       _id: documentId,
+      $and: [generationFilter],
       $or: [
         { extractionStatus: { $in: ['NOT_STARTED', 'QUEUED', 'FAILED'] } },
         { extractionStatus: 'PROCESSING', extractionStartedAt: { $lte: staleBefore } },
@@ -127,18 +130,20 @@ export async function claimLabDocumentExtraction(documentId: string, now = new D
       $set: {
         status: 'PROCESSING',
         extractionStatus: 'PROCESSING',
+        processingStage: 'OCR',
         extractionStartedAt: now,
         extractionError: undefined,
       },
+      $inc: { processingAttempts: 1 },
     },
     { new: true },
   ).lean();
 }
 
-async function ensureLabExtractionOutbox(document: { _id: unknown; clinicOrganizationId: unknown; patientId: unknown; apexcareOrganizationId: unknown; sha256: string }) {
+async function ensureLabExtractionOutbox(document: { _id: unknown; clinicOrganizationId: unknown; patientId: unknown; apexcareOrganizationId: unknown; sha256: string; processingVersion?: number }) {
   await enqueueOutboxEvent({
     organizationId: String(document.clinicOrganizationId),
-    eventKey: `LAB_DOCUMENT_EXTRACTED:${String(document._id)}:v${LAB_PDF_EXTRACTION_VERSION}`,
+    eventKey: `LAB_DOCUMENT_EXTRACTED:${String(document._id)}:v${document.processingVersion ?? 1}:ocr${LAB_PDF_EXTRACTION_VERSION}`,
     eventType: 'LAB_DOCUMENT_EXTRACTED',
     aggregateType: 'LabDocument',
     aggregateId: String(document._id),
@@ -148,25 +153,30 @@ async function ensureLabExtractionOutbox(document: { _id: unknown; clinicOrganiz
       clinicOrganizationId: String(document.clinicOrganizationId),
       apexcareOrganizationId: String(document.apexcareOrganizationId),
       sha256: document.sha256,
+      processingVersion: document.processingVersion ?? 1,
     },
   });
 }
 
-export async function processLabDocumentExtraction(documentId: string, now = new Date()) {
-  const document = await claimLabDocumentExtraction(documentId, now);
+export async function processLabDocumentExtraction(documentId: string, now = new Date(), processingVersion = 1) {
+  const document = await claimLabDocumentExtraction(documentId, now, processingVersion);
   if (!document) {
-    const completed = await LabDocument.findOne({ _id: documentId, extractionStatus: 'COMPLETED' }).select('_id clinicOrganizationId patientId apexcareOrganizationId sha256').lean();
+    const completed = await LabDocument.findOne({ _id: documentId, ...(processingVersion === 1 ? { $or: [{ processingVersion: 1 }, { processingVersion: { $exists: false } }] } : { processingVersion }), extractionStatus: 'COMPLETED' }).select('_id clinicOrganizationId patientId apexcareOrganizationId sha256 processingVersion').lean();
     if (completed) await ensureLabExtractionOutbox(completed);
     return { processed: false, idempotent: true };
   }
 
   let extractionPersisted = false;
   try {
-    const pdf = await readLabPdf(document.storageKey);
-    const extractedText = extractPdfText(pdf);
+    const pdf = await readLabPdf(document.storageKey, document.storageProvider);
+    const ocr = await runMedicalDocumentOcr(pdf, 'application/pdf');
+    if (ocr.status === 'FAILED') throw new Error('PADDLEOCR_REQUEST_FAILED');
+    const extractedText = ocr.status === 'COMPLETED' ? (ocr.rawText ?? '') : extractPdfText(pdf);
+    const legacyPdfFallback = ocr.status === 'UNAVAILABLE';
     const updated = await LabDocument.updateOne(
       {
         _id: document._id,
+        $and: [processingVersion === 1 ? { $or: [{ processingVersion: 1 }, { processingVersion: { $exists: false } }] } : { processingVersion }],
         clinicOrganizationId: document.clinicOrganizationId,
         patientId: document.patientId,
         sha256: document.sha256,
@@ -177,6 +187,14 @@ export async function processLabDocumentExtraction(documentId: string, now = new
           status: 'EXTRACTED',
           extractionStatus: 'COMPLETED',
           extractedText,
+          ocrLines: ocr.lines ?? [],
+          ocrEngine: legacyPdfFallback ? 'LOCAL_PDF_TEXT' : 'PADDLEOCR',
+          ocrEngineVersion: legacyPdfFallback ? 'legacy-parser-v1' : '2.9.1',
+          ocrProcessedAt: new Date(),
+          ocrWarningCode: ocr.warningCode ?? (legacyPdfFallback ? 'PADDLEOCR_NOT_CONFIGURED' : undefined),
+          extractionWarningCode: ocr.warningCode ?? (legacyPdfFallback ? 'PADDLEOCR_NOT_CONFIGURED' : undefined),
+          processingStage: 'AI_EXTRACTION',
+          safeLastErrorCode: undefined,
           extractionVersion: LAB_PDF_EXTRACTION_VERSION,
           extractionError: undefined,
         },
@@ -191,8 +209,8 @@ export async function processLabDocumentExtraction(documentId: string, now = new
     const message = error instanceof Error ? error.message : 'LAB_PDF_EXTRACTION_FAILED';
     if (!extractionPersisted) {
       await LabDocument.updateOne(
-        { _id: document._id, extractionStatus: 'PROCESSING' },
-        { $set: { status: 'FAILED', extractionStatus: 'FAILED', extractionError: message.slice(0, 1000) }, $unset: { extractionStartedAt: 1 } },
+        { _id: document._id, $and: [processingVersion === 1 ? { $or: [{ processingVersion: 1 }, { processingVersion: { $exists: false } }] } : { processingVersion }], extractionStatus: 'PROCESSING' },
+        { $set: { status: 'FAILED', extractionStatus: 'FAILED', extractionError: /^[A-Z0-9_:-]+$/.test(message) ? message.slice(0, 100) : 'LAB_PDF_EXTRACTION_FAILED', processingStage: 'FAILED', safeLastErrorCode: 'LAB_OCR_FAILED' }, $unset: { extractionStartedAt: 1 } },
       );
     }
     throw error;

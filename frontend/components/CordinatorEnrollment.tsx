@@ -24,6 +24,7 @@ type PatientForEnrollment = {
   };
 
   phone?: string;
+  dateOfBirth?: string;
 
   enrollmentStatus?: string;
 
@@ -52,11 +53,12 @@ export function CoordinatorEnrollment({
   const [consentGiven, setConsentGiven] =
     useState(false);
   const [phone, setPhone] = useState(patient.phone || '');
+  const [dateOfBirth, setDateOfBirth] = useState(patient.dateOfBirth?.slice(0, 10) || '');
   const [whatsapp, setWhatsapp] = useState('');
   const [preferredLanguage, setPreferredLanguage] = useState('en');
   const [preferredContactChannel, setPreferredContactChannel] = useState<'PHONE' | 'SMS' | 'WHATSAPP' | 'APP'>('PHONE');
   const [savingProfile, setSavingProfile] = useState(false);
-  const [profileSaved, setProfileSaved] = useState(Boolean(patient.phone));
+  const [profileSaved, setProfileSaved] = useState(Boolean(patient.phone && patient.dateOfBirth));
 
   const [consentMethod, setConsentMethod] =
     useState<
@@ -88,10 +90,10 @@ export function CoordinatorEnrollment({
   const [vitalsCaptured, setVitalsCaptured] = useState(false);
 
   async function saveProfile() {
-    if (!phone.trim()) { setMessage('A patient phone number is required before enrolment.'); return; }
+    if (!phone.trim() || !dateOfBirth) { setMessage('Phone number and date of birth are required before enrolment.'); return; }
     setSavingProfile(true); setMessage('');
     try {
-      await updateEnrollmentProfile(patient._id, { phone: phone.trim(), ...(whatsapp.trim() ? { whatsapp: whatsapp.trim() } : {}), preferredLanguage: preferredLanguage.trim() || 'en', preferredContactChannel });
+      await updateEnrollmentProfile(patient._id, { phone: phone.trim(), dateOfBirth, ...(whatsapp.trim() ? { whatsapp: whatsapp.trim() } : {}), preferredLanguage: preferredLanguage.trim() || 'en', preferredContactChannel });
       setProfileSaved(true);
       setMessage('Patient contact details saved.');
     } catch (error) { setMessage(error instanceof Error ? error.message : 'Unable to save patient contact details.'); }
@@ -124,11 +126,11 @@ export function CoordinatorEnrollment({
       setMessage('Record both systolic and diastolic blood pressure before enrolment.');
       return;
     }
-    if (pulse && (!Number.isFinite(pulseValue) || pulseValue < 20 || pulseValue > 250)) {
+    if (pulse && (pulseValue === undefined || !Number.isFinite(pulseValue) || pulseValue < 20 || pulseValue > 250)) {
       setMessage('Enter a valid pulse between 20 and 250 bpm.');
       return;
     }
-    if (weightKg && (!Number.isFinite(weightValue) || weightValue < 1 || weightValue > 500)) {
+    if (weightKg && (weightValue === undefined || !Number.isFinite(weightValue) || weightValue < 1 || weightValue > 500)) {
       setMessage('Enter a valid weight between 1 and 500 kg.');
       return;
     }
@@ -153,6 +155,10 @@ export function CoordinatorEnrollment({
   }
 
   async function submit() {
+    if (!profileSaved || !phone.trim() || !dateOfBirth) {
+      setMessage('Save the patient’s phone number and date of birth before enrolment.');
+      return;
+    }
     if (!prescriptionUploaded) {
       setMessage('Prescription capture is required before ApexCare enrolment.');
       return;
@@ -348,11 +354,12 @@ export function CoordinatorEnrollment({
           <div>
             <div className="eyebrow">Step 0 · Contact details</div>
             <h3>Confirm patient contact details</h3>
-            <p className="muted">The phone number is required by the enrollment backend and will also be used for coordinator follow-up.</p>
+            <p className="muted">Record the patient’s date of birth and preferred contact details for enrollment.</p>
           </div>
         </div>
         <div className="enrolment-form-grid">
           <label>Phone number<input value={phone} onChange={(e) => { setPhone(e.target.value); setProfileSaved(false); }} placeholder="+91…" /></label>
+          <label>Date of birth<input type="date" required value={dateOfBirth} onChange={(e) => { setDateOfBirth(e.target.value); setProfileSaved(false); }} /></label>
           <label>WhatsApp (optional)<input value={whatsapp} onChange={(e) => setWhatsapp(e.target.value)} placeholder="+91…" /></label>
           
             <label className="field">
@@ -370,7 +377,7 @@ export function CoordinatorEnrollment({
 </label>
           <label>Preferred channel<select value={preferredContactChannel} onChange={(e) => setPreferredContactChannel(e.target.value as typeof preferredContactChannel)}><option value="PHONE">Phone</option><option value="SMS">SMS</option><option value="WHATSAPP">WhatsApp</option><option value="APP">Patient app</option></select></label>
         </div>
-        <button type="button" className="secondary full-action" onClick={() => void saveProfile()} disabled={savingProfile || !phone.trim()}>{savingProfile ? 'Saving…' : profileSaved ? 'Contact details saved' : 'Save contact details'}</button>
+        <button type="button" className="secondary full-action" onClick={() => void saveProfile()} disabled={savingProfile || !phone.trim() || !dateOfBirth}>{savingProfile ? 'Saving…' : profileSaved ? 'Contact details saved' : 'Save contact details'}</button>
       </div>
 
       {/* ======================================================
@@ -529,6 +536,7 @@ export function CoordinatorEnrollment({
           disabled={
             saving ||
             !consentGiven ||
+            !profileSaved ||
             !prescriptionUploaded ||
             !vitalsCaptured ||
             uploadingPrescription ||

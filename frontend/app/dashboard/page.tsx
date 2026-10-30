@@ -1,6 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useState } from 'react';
+import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import {
   Activity,
@@ -538,16 +539,21 @@ export default function Dashboard() {
 }
 
 function DashboardByRole() {
+  const router = useRouter();
   const [role, setRole] = useState<string | null>(null);
   useEffect(() => {
     try {
       const raw = localStorage.getItem('apexcare_user');
       const parsed = raw ? JSON.parse(raw) : null;
-      setRole(parsed?.roles?.[0] || null);
+      const roles = parsed?.roles || [];
+      const currentRole = roles.includes('CLINIC_COORDINATOR') ? 'CLINIC_COORDINATOR' : roles[0] || null;
+      setRole(currentRole);
+      if (currentRole === 'CLINIC_COORDINATOR') router.replace('/care-queue');
     } catch { setRole(null); }
-  }, []);
+  }, [router]);
 
   if (role === 'CLINIC_ADMIN') return <Shell title="Good morning." subtitle="A business and operations view of your chronic-care clinic."><ClinicAdminDashboard /></Shell>;
   if (role === 'CLINICIAN') return <Shell title="Good morning." subtitle="A focused clinical command center for decisions that need you."><ClinicalDashboard /></Shell>;
+  if (role === 'CLINIC_COORDINATOR') return <Shell title="Opening your care queue…" subtitle="Your coordinator worklist is loading."><div className="empty-state"><span className="loading-orb" /><b>Loading care queue…</b></div></Shell>;
   return <Shell title="Good morning." subtitle="Your patient to-do list and operational care workspace."><StaffDashboard /></Shell>;
 }

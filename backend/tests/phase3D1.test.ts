@@ -58,6 +58,10 @@ describe('Phase 3D.1 lab PDF ingestion', () => {
     expect(first.idempotent).toBe(false);
     expect(first.document.mimeType).toBe('application/pdf');
     expect(first.document.status).toBe('UPLOADED');
+    expect(first.document.storageProvider).toMatch(/^(local|s3)$/);
+    expect(first.document.storageKey).not.toContain(String(organizationId));
+    expect(first.document.storageKey).not.toContain(String(patientId));
+    expect(first.document.processingStage).toBe('QUEUED');
     expect(await LabDocument.countDocuments({ clinicOrganizationId: organizationId, patientId })).toBe(1);
     expect(await OutboxEvent.countDocuments({ organizationId, eventType: 'LAB_DOCUMENT_UPLOADED' })).toBe(1);
   });

@@ -187,9 +187,9 @@ async function main() {
   const periodEnd = dateDaysFromNow(30);
   await Subscription.create({
     organizationId: clinic._id,
-    planCode: 'TRIAL_50',
+    planCode: 'TRIAL_100',
     status: 'TRIAL',
-    activePatientLimit: 50,
+    activePatientLimit: 100,
     activePatientCount: 3,
     currentPeriodStart: periodStart,
     currentPeriodEnd: periodEnd,

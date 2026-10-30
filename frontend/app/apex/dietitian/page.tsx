@@ -83,7 +83,8 @@ function DietitianContent() {
   const generationStatus = selected?.carePlanGenerationStatus || 'NOT_STARTED';
   const canCreateAssessment = selectedEligible && generationStatus === 'NOT_STARTED' && !selected?.assessment;
   const canRetry = selectedEligible && generationStatus === 'FAILED' && Boolean(selected?.assessment);
-  const formReadOnly = Boolean(selected?.assessment) || ['QUEUED', 'PROCESSING', 'COMPLETED'].includes(generationStatus);
+  const canUpdateDietChart = selectedEligible && generationStatus === 'COMPLETED';
+  const formReadOnly = ['QUEUED', 'PROCESSING'].includes(generationStatus);
 
   function openAssessment(item: ApexCareEnrollment) {
     const data = item.assessment?.assessmentData;
@@ -108,15 +109,15 @@ function DietitianContent() {
       setSubmitError('Add the dietitian assessment notes before generating a draft.');
       return;
     }
-    if (!canCreateAssessment && !canRetry) return;
+    if (!canCreateAssessment && !canRetry && !canUpdateDietChart) return;
 
     setBusy(true);
     setSubmitError(null);
     setSubmitMessage(null);
     try {
       const result = await submitDietitianAssessment(selected.patientId, {
-        remarks: canRetry ? (selected.assessment?.remarks || remarks).trim() : remarks.trim(),
-        assessmentData: canRetry ? (selected.assessment?.assessmentData ?? {}) : {
+        remarks: remarks.trim(),
+        assessmentData: {
           dietaryPattern: dietaryPattern.trim(),
           foodPreferences: foodPreferences.trim(),
           allergiesOrIntolerances: allergiesOrIntolerances.trim(),
@@ -149,7 +150,9 @@ function DietitianContent() {
         carePlanGenerationError: null,
       } : item) ?? current);
 
-      if (result.carePlanGenerationStatus === 'FAILED') {
+      if (canUpdateDietChart) {
+        setSubmitMessage('Dietitian chart saved. Updates to the clinical care plan still require clinician review and approval.');
+      } else if (result.carePlanGenerationStatus === 'FAILED') {
         setSubmitError('The assessment was saved, but care-plan generation failed. Review the generation status and retry when the issue is resolved.');
       } else {
         setSubmitMessage(result.carePlanGenerationStatus === 'COMPLETED'
@@ -170,7 +173,7 @@ function DietitianContent() {
   const pendingCount = items?.filter((item) => item.carePlanGenerationStatus === 'NOT_STARTED' && !item.assessment).length ?? 0;
   const generatingCount = items?.filter((item) => ['QUEUED', 'PROCESSING'].includes(item.carePlanGenerationStatus || '')).length ?? 0;
 
-  return <ApexShell title="Dietitian workspace" subtitle="Review patients handed off by the ApexCare coordinator, record nutrition context and queue a hypertension care-plan draft for clinician review.">
+  return <ApexShell title="Dietitian workspace" subtitle="Record or update the dietitian-managed chart. Clinical care-plan drafts remain subject to clinician approval.">
     <section className="grid g3 section dietitian-stat-grid">
       <div className="card glass stat"><Utensils size={19} /><small>Patients handed off</small><strong>{items?.length ?? '…'}</strong></div>
       <div className="card glass stat"><ClipboardCheck size={19} /><small>Assessments to complete</small><strong>{pendingCount}</strong></div>
@@ -225,8 +228,7 @@ function DietitianContent() {
           </div>
           {selected.assessment && <p className="apex-form-note">An assessment has already been saved for this enrollment. The backend reuses it for retries, so these fields are read-only.</p>}
           <div className="apex-assessment-actions">
-            {canCreateAssessment && <button className="primary" onClick={() => void saveAssessment()} disabled={busy || !remarks.trim()}><Send size={15} /> {busy ? 'Submitting…' : 'Submit assessment and generate draft'}</button>}
-            {canRetry && <button className="primary" onClick={() => void saveAssessment()} disabled={busy}><RefreshCw size={15} /> {busy ? 'Retrying…' : 'Retry care-plan generation'}</button>}
+            {(canCreateAssessment || canRetry || canUpdateDietChart) && <button className="primary" onClick={() => void saveAssessment()} disabled={busy || !remarks.trim()}><Send size={15} /> {busy ? 'Saving…' : canUpdateDietChart ? 'Save dietitian chart' : canRetry ? 'Retry care-plan generation' : 'Save assessment'}</button>}
             {['QUEUED', 'PROCESSING'].includes(generationStatus) && <span className="muted"><RefreshCw size={14} /> Waiting for worker</span>}
             {generationStatus === 'COMPLETED' && <span className="apex-completion-label"><CheckCircle2 size={15} /> Draft sent for clinician review</span>}
           </div>

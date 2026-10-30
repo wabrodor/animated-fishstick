@@ -1,4 +1,4 @@
-import type { CarePlan, CareQueue, CareQueueTask, Diagnosis, Me, OpdVisit, Patient, ServiceCase, VitalRecord, VisitAssist, VisitReview, VisitReviewAnswer, CreatePatientInput, NewDiagnosisQueueItem, ClinicalSignal, SubscriptionSummary, ClinicTeamMember, ApexCareReferral, ApexCareEnrollment, DietitianServiceCase, CoordinatorReview, PatientReviewAnswer, ApexCareCoordinatorCallOutcome, ApexCareGeneralHistory, SaveApexCareGeneralHistoryInput } from '@/types/api';
+import type { CarePlan, CareQueue, CareQueueTask, Diagnosis, Me, OpdVisit, Patient, ServiceCase, VitalRecord, VisitAssist, VisitReview, VisitReviewAnswer, CreatePatientInput, NewDiagnosisQueueItem, ClinicalSignal, SubscriptionSummary, ClinicTeamMember, ApexCareReferral, ApexCareEnrollment, DietitianServiceCase, CoordinatorReview, PatientReviewAnswer, ApexCareCoordinatorCallOutcome, ApexCareGeneralHistory, ApexCareGeneralHistoryPatientSnapshot, SaveApexCareGeneralHistoryInput } from '@/types/api';
 
 export const API = (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000/api/v1').replace(/\/$/, '');
 export const SOCKET_URL = (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000/api/v1').replace(/\/api\/v1\/?$/, '');
@@ -45,6 +45,8 @@ async function wait<T>(value: T, delay = 150) {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const isMutation = Boolean(init?.method && !['GET', 'HEAD', 'OPTIONS'].includes(init.method.toUpperCase()));
+  const notify = (ok: boolean) => { if (isMutation && typeof window !== 'undefined') window.dispatchEvent(new CustomEvent('apexcare:feedback', { detail: { ok } })); };
   const token =
     typeof window !== 'undefined'
       ? localStorage.getItem('apexcare_token')
@@ -62,6 +64,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       },
     });
   } catch {
+    notify(false);
     const error = new Error(
       'Unable to connect to the ApexCare server. Please try again after sometime.'
     ) as Error & {
@@ -78,6 +81,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const body = await response.json().catch(() => ({}));
 
   if (!response.ok) {
+    notify(false);
     const error = body?.error;
 
     if (
@@ -101,6 +105,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     throw err;
   }
 
+  notify(true);
   return body.data as T;
 }
 
@@ -109,7 +114,7 @@ export async function login(email: string, password: string) {
   return request<{ accessToken: string; user: Me }>('/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) });
 }
 
-export async function updateEnrollmentProfile(patientId: string, input: { phone?: string; whatsapp?: string; preferredLanguage?: string; preferredContactChannel?: 'PHONE' | 'SMS' | 'WHATSAPP' | 'APP' }) {
+export async function updateEnrollmentProfile(patientId: string, input: { phone: string; dateOfBirth: string; whatsapp?: string; preferredLanguage?: string; preferredContactChannel?: 'PHONE' | 'SMS' | 'WHATSAPP' | 'APP' }) {
   return request<Pick<Patient, '_id' | 'name' | 'phone' | 'whatsapp' | 'preferredLanguage' | 'preferredContactChannel' | 'enrollmentStatus'>>(`/patients/${encodeURIComponent(patientId)}/enrollment-profile`, { method: 'PATCH', body: JSON.stringify(input) });
 }
 
@@ -176,8 +181,30 @@ export async function apexCoordinatorQueue() {
   return request<ApexCareEnrollment[]>('/apexcare/coordinator-queue');
 }
 
+export async function apexDietitianQueue() {
+  return request<ApexCareEnrollment[]>('/apexcare/dietitian-queue');
+}
+
+export async function submitDietitianAssessment(
+  patientId: string,
+  input: { remarks: string; assessmentData?: Record<string, unknown> },
+) {
+  return request<{
+    assessment: { _id: string; remarks: string; assessmentData?: Record<string, unknown> };
+    carePlanGenerationStatus: string;
+    jobId?: string | null;
+    carePlanDraftId?: string;
+  }>(`/apexcare/patients/${encodeURIComponent(patientId)}/dietitian-assessment`, {
+    method: 'POST', body: JSON.stringify(input),
+  });
+}
+
 export async function apexReferrals() {
   return request<ApexCareReferral[]>('/apexcare/referrals');
+}
+
+export async function apexcareReferrals() {
+  return request<ApexCareReferral[]>('/care-queue/apexcare-referrals');
 }
 
 export async function apexServiceCases() {
@@ -191,26 +218,14 @@ export async function updateCoordinatorCall(enrollmentId: string, status: ApexCa
   });
 }
 
-/**
- * Read the general medical history attached to an ApexCare enrollment.
- *
- * Backend dependency: implement GET
- * /apexcare/enrollments/:enrollmentId/general-history.
- * The endpoint should return data: null when history has not been started.
- */
+/** Read the saved general medical history attached to an ApexCare enrollment. */
 export async function apexGeneralMedicalHistory(enrollmentId: string) {
   return request<ApexCareGeneralHistory | null>(
     `/apexcare/enrollments/${encodeURIComponent(enrollmentId)}/general-history`,
   );
 }
 
-/**
- * Create or update the general medical history attached to an enrollment.
- *
- * Backend dependency: implement an authenticated, organization-scoped PUT
- * /apexcare/enrollments/:enrollmentId/general-history endpoint. The server,
- * not the browser, should derive the collector identity and history status.
- */
+/** Save a draft or record the coordinator-collected history. No clinician approval is involved. */
 export async function saveApexGeneralMedicalHistory(
   enrollmentId: string,
   input: SaveApexCareGeneralHistoryInput,
@@ -221,6 +236,13 @@ export async function saveApexGeneralMedicalHistory(
       method: 'PUT',
       body: JSON.stringify(input),
     },
+  );
+}
+
+/** Read the latest recorded coordinator-collected history in Patient 360. */
+export async function patientApexGeneralHistory(patientId: string) {
+  return request<ApexCareGeneralHistoryPatientSnapshot | null>(
+    `/patients/${encodeURIComponent(patientId)}/apexcare/general-history`,
   );
 }
 
@@ -460,8 +482,13 @@ export async function generateDraft(id: string) {
 }
 
 export async function drafts(id: string) {
-  if (MOCK) return wait([{ _id: 'draft-demo', status: 'QUEUED', createdAt: new Date().toISOString(), plan: { goals: [{ title: 'Monitor blood pressure', target: 'Record BP weekly' }], tasks: [] } }]);
+  if (MOCK) return wait([{ _id: 'draft-demo', status: 'CLINICIAN_REVIEW', source: 'RULES', createdAt: new Date().toISOString(), clinicianReviewDueAt: new Date(Date.now() + 86400000).toISOString(), inputSnapshot: { ageYears: 58, sexAtBirth: 'UNKNOWN', latestBloodPressure: { systolic: 138, diastolic: 86, recordedAt: new Date().toISOString() }, dataCompleteness: { score: 62, known: ['diagnosis', 'bloodPressure', 'coordinatorGeneralHistory'], missing: ['weight', 'laboratoryResults', 'medicationAdherence'] } }, plan: { summary: 'Synthetic example only. Review patient-specific facts and adjust this draft before approval.', goals: [{ title: 'Track blood pressure', target: 'Record measurements using the clinic-approved schedule', rationale: 'Trend data supports clinician review.' }, { title: 'Attend scheduled review', target: 'Complete the planned OPD review', rationale: 'Clinician to assess progress.' }], tasks: [{ type: 'VITALS', title: 'Record blood pressure and weight', dueDay: 0, rationale: 'Refresh baseline measurements.' }, { type: 'OPD_VISIT', title: 'Clinician review', dueDay: 30, rationale: 'Review symptoms, measurements and current treatment.' }, { type: 'FOLLOW_UP', title: 'Coordinator check-in', dueDay: 14, rationale: 'Check access and appointment barriers.' }], clinicalInterventionNeeded: true, confidence: 0.62, safetyNotes: ['Synthetic mock data. Not for clinical care.', 'Medication and laboratory details are unknown and must be verified.'] } }]);
   return request<Array<Record<string, unknown>>>(`/patients/${encodeURIComponent(id)}/hypertension/care-plan-drafts`);
+}
+
+export async function updateDraftPlan(patientId: string, draftId: string, plan: Record<string, unknown>) {
+  if (MOCK) return wait({ _id: draftId, status: 'CLINICIAN_REVIEW', plan });
+  return request<Record<string, unknown>>(`/patients/${encodeURIComponent(patientId)}/hypertension/care-plan-drafts/${encodeURIComponent(draftId)}`, { method: 'PATCH', body: JSON.stringify(plan) });
 }
 
 export async function approveDraft(patientId: string, draftId: string) {
@@ -504,6 +531,34 @@ export async function getVisitReviews(
 
 export async function labDocuments(id: string) {
   return request<import('@/types/api').LabDocument[]>(`/patients/${encodeURIComponent(id)}/lab-documents`);
+}
+
+export async function uploadLabDocument(patientId: string, file: File) {
+  return uploadBinary<{ document: import('@/types/api').LabDocument; idempotent: boolean }>(
+    `/patients/${encodeURIComponent(patientId)}/lab-documents`,
+    file,
+    { 'Content-Type': 'application/pdf', 'Idempotency-Key': crypto.randomUUID(), 'X-File-Name': file.name || 'lab-report.pdf' },
+  );
+}
+
+export async function retryLabDocument(patientId: string, documentId: string, stage?: 'OCR' | 'AI_EXTRACTION') {
+  return request<{ documentId: string; processingVersion: number; stage: string; jobId: string }>(
+    `/patients/${encodeURIComponent(patientId)}/lab-documents/${encodeURIComponent(documentId)}/retry`,
+    { method: 'POST', body: JSON.stringify(stage ? { stage } : {}) },
+  );
+}
+
+export async function fetchLabDocumentFile(patientId: string, documentId: string): Promise<Blob> {
+  const token = typeof window !== 'undefined' ? localStorage.getItem('apexcare_token') : null;
+  const response = await fetch(`${API}/patients/${encodeURIComponent(patientId)}/lab-documents/${encodeURIComponent(documentId)}/file`, {
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+    cache: 'no-store',
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({}));
+    throw new Error(payload?.error?.message || 'Unable to open the lab report.');
+  }
+  return response.blob();
 }
 
 export async function labResults(id: string, documentId: string) {

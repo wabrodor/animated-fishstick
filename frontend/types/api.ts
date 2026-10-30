@@ -2,6 +2,8 @@ export type Patient = {
   _id: string;
   medicalRecordNumber?: string;
   name: { first: string; last?: string };
+  dateOfBirth?: string;
+  ageAtRegistration?: number;
   phone?: string;
   whatsapp?: string;
   preferredLanguage?: string;
@@ -20,7 +22,7 @@ export type CreatePatientInput = {
     last?: string;
   };
 
-  dateOfBirth?: string;
+  ageAtRegistration: number;
 
   sexAtBirth?:
     | 'FEMALE'
@@ -117,6 +119,7 @@ export type ServiceCase = {
   patientId: string;
   requestedByUserId: string;
   assignedApexcareUserId?: string;
+  createdAt?: string;
 };
 export type CoordinatorReview = {
   _id: string;
@@ -208,7 +211,7 @@ export type NewDiagnosisQueueItem = {
 
   patientName: string;
 
-  diagnosedAt: string;
+  diagnosedAt: string | null;
 
   enrollmentStatus:
     | 'NOT_ENROLLED'
@@ -219,6 +222,11 @@ export type NewDiagnosisQueueItem = {
 
   assignedClinicianId?: string;
   assignedClinicianName?: string | null;
+  condition?: string;
+  referralId?: string;
+  referredAt?: string;
+  staffEscalationDueAt?: string;
+  staffEscalatedAt?: string | null;
 };
 
 export type VisitAssistQuestion = {
@@ -279,6 +287,14 @@ export type LabDocument = {
   extractionStatus?: string;
   structuringStatus?: string;
   interpretationStatus?: string;
+  processingStage?: string;
+  processingVersion?: number;
+  processingAttempts?: number;
+  safeLastErrorCode?: string;
+  extractionWarningCode?: string;
+  ocrEngine?: string;
+  ocrEngineVersion?: string;
+  ocrWarningCode?: string;
   structuredResultCount?: number;
   uploadedAt?: string;
   createdAt?: string;
@@ -295,6 +311,10 @@ export type LabResult = {
   referenceRangeText?: string;
   abnormalFlag: 'HIGH' | 'LOW' | 'NORMAL' | 'UNKNOWN';
   extractionConfidence?: number;
+  reviewStatus?: 'UNVERIFIED' | 'VERIFIED' | 'SUPERSEDED';
+  sourceText?: string;
+  sourcePage?: number;
+  extractionMethod?: string;
 };
 
 export type LabInterpretation = {
@@ -416,6 +436,7 @@ export type ApexCareReferral = {
   condition?: string;
   status?: string;
   referredAt?: string;
+  staffEscalationDueAt?: string;
   staffEscalatedAt?: string | null;
 };
 
@@ -434,9 +455,7 @@ export type ApexCareCoordinatorCallOutcome = Exclude<
 export type ApexCareGeneralHistoryStatus =
   | 'NOT_STARTED'
   | 'IN_PROGRESS'
-  | 'PENDING_REVIEW'
-  | 'COMPLETED'
-  | 'DECLINED';
+  | 'RECORDED';
 
 export type ApexCareGeneralHistorySection =
   | 'PAST_MEDICAL'
@@ -469,26 +488,45 @@ export type ApexCareGeneralHistory = {
   _id: string;
   enrollmentId: string;
   patientId: string;
-  status: ApexCareGeneralHistoryStatus;
+  status: 'IN_PROGRESS' | 'RECORDED';
   questionnaireVersion: string;
   answers: ApexCareGeneralHistoryAnswer[];
   notes?: string;
   collectedByUserId?: string;
   collectedAt?: string;
-  submittedAt?: string;
-  reviewedByUserId?: string;
-  reviewedAt?: string;
+  recordedAt?: string;
+  events?: Array<{
+    eventType: 'DRAFT_SAVED' | 'RECORDED';
+    actorUserId: string;
+    actorRole: 'APEXCARE_COORDINATOR';
+    createdAt: string;
+  }>;
   createdAt?: string;
   updatedAt?: string;
 };
 
-/** Client input; collector identity and persisted status must be assigned by the API. */
+/** Read-only history snapshot returned to the assigned clinic clinician. */
+export type ApexCareGeneralHistoryPatientSnapshot = {
+  _id: string;
+  patientId: string;
+  status: 'RECORDED';
+  source: 'APEXCARE_COORDINATOR';
+  questionnaireVersion: string;
+  answers: ApexCareGeneralHistoryAnswer[];
+  notes?: string;
+  collectedAt?: string;
+  collectedByName?: string;
+  recordedAt?: string;
+  updatedAt?: string;
+};
+
+/** Client input; collector identity and persisted status are assigned by the API. */
 export type SaveApexCareGeneralHistoryInput = {
   questionnaireVersion: string;
   answers: ApexCareGeneralHistoryAnswer[];
   notes?: string;
-  /** True when the coordinator is submitting the intake rather than saving a draft. */
-  submit?: boolean;
+  /** True when the coordinator is recording the completed intake as history. */
+  record?: boolean;
 };
 
 export type ApexCareEnrollment = {
@@ -501,14 +539,19 @@ export type ApexCareEnrollment = {
   generalHistoryId?: string | null;
   generalHistoryStatus?: ApexCareGeneralHistoryStatus;
   generalHistoryUpdatedAt?: string | null;
-  generalHistoryCompletedAt?: string | null;
+  generalHistoryRecordedAt?: string | null;
+  generalHistoryCompletedAt?: string | null; // legacy compatibility only
   dietitianAssessmentStatus?: 'PENDING' | 'COMPLETED';
   carePlanGenerationStatus?: string;
+  carePlanGenerationJobId?: string | null;
+  carePlanGenerationError?: string | null;
   carePlanDraftId?: string;
   status?: 'PENDING' | 'ACTIVE' | 'PAUSED' | 'ENDED';
   enrolledAt?: string;
   createdAt?: string;
   updatedAt?: string;
+  patient?: Pick<Patient, '_id' | 'name' | 'conditions' | 'medicalRecordNumber' | 'phone' | 'preferredContactChannel' | 'preferredLanguage'>;
+  assessment?: { _id?: string; remarks?: string; assessmentData?: Record<string, unknown>; completedAt?: string } | null;
 };
 
 export type DietitianServiceCase = {
