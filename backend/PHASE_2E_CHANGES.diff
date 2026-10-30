@@ -1,0 +1,131 @@
+diff -ruN /mnt/data/p2e_original/AI_CARE_PLAN_CHANGES.md /mnt/data/p2e_rebuild/AI_CARE_PLAN_CHANGES.md
+--- /mnt/data/p2e_original/AI_CARE_PLAN_CHANGES.md	2026-09-19 12:58:36.000000000 +0000
++++ /mnt/data/p2e_rebuild/AI_CARE_PLAN_CHANGES.md	2026-09-21 06:17:26.880828174 +0000
+@@ -28,3 +28,12 @@
+ ## Important safety boundary
+ 
+ AI is decision support only. It cannot activate a plan, prescribe medication, change medication, diagnose the patient, or modify clinical data without an authenticated clinician action.
++
++
++## Phase 2E asynchronous workflow
++
++- Dietitian assessment requires `coordinatorCallStatus=CONTACTED`.
++- Care-plan generation is queued through BullMQ instead of running in the HTTP request.
++- The dietitian endpoint returns HTTP 202 with the queued job id.
++- The AI worker creates the draft, links it to the ApexCare enrollment, moves the patient to `CARE_PLAN_REVIEW`, and schedules the existing 24-hour clinician review SLA.
++- If queue submission fails, the dietitian assessment is rolled back to `PENDING`.
+diff -ruN /mnt/data/p2e_original/PHASE_2E_CHANGES.diff /mnt/data/p2e_rebuild/PHASE_2E_CHANGES.diff
+--- /mnt/data/p2e_original/PHASE_2E_CHANGES.diff	1970-01-01 00:00:00.000000000 +0000
++++ /mnt/data/p2e_rebuild/PHASE_2E_CHANGES.diff	2026-09-21 06:17:27.419153236 +0000
+@@ -0,0 +1,16 @@
++diff -ruN /mnt/data/p2e_original/AI_CARE_PLAN_CHANGES.md /mnt/data/p2e_rebuild/AI_CARE_PLAN_CHANGES.md
++--- /mnt/data/p2e_original/AI_CARE_PLAN_CHANGES.md	2026-09-19 12:58:36.000000000 +0000
+++++ /mnt/data/p2e_rebuild/AI_CARE_PLAN_CHANGES.md	2026-09-21 06:17:26.880828174 +0000
++@@ -28,3 +28,12 @@
++ ## Important safety boundary
++ 
++ AI is decision support only. It cannot activate a plan, prescribe medication, change medication, diagnose the patient, or modify clinical data without an authenticated clinician action.
+++
+++
+++## Phase 2E asynchronous workflow
+++
+++- Dietitian assessment requires `coordinatorCallStatus=CONTACTED`.
+++- Care-plan generation is queued through BullMQ instead of running in the HTTP request.
+++- The dietitian endpoint returns HTTP 202 with the queued job id.
+++- The AI worker creates the draft, links it to the ApexCare enrollment, moves the patient to `CARE_PLAN_REVIEW`, and schedules the existing 24-hour clinician review SLA.
+++- If queue submission fails, the dietitian assessment is rolled back to `PENDING`.
+diff -ruN /mnt/data/p2e_original/queues.ts /mnt/data/p2e_rebuild/queues.ts
+--- /mnt/data/p2e_original/queues.ts	2026-09-20 07:19:37.000000000 +0000
++++ /mnt/data/p2e_rebuild/queues.ts	2026-09-21 06:17:19.207547376 +0000
+@@ -32,10 +32,10 @@
+   );
+ }
+ 
+-export async function scheduleHypertensionDraftGeneration(patientId: string, organizationId: string, clinicianId: string): Promise<void> {
++export async function scheduleHypertensionDraftGeneration(patientId: string, organizationId: string, clinicianId: string): Promise<string> {
+ 
+   console.log('[ENROLL] scheduling hypertension draft generation for patient:', patientId, 'organization:', organizationId, 'clinician:', clinicianId);
+-  await aiCarePlanQueue.add(
++  const job = await aiCarePlanQueue.add(
+     'generate-hypertension-draft',
+     { patientId, organizationId, clinicianId },
+     {
+@@ -45,8 +45,8 @@
+       attempts: 3,
+       backoff: { type: 'exponential', delay: 2000 },
+     },
+-    
+   );
++  return String(job.id);
+ }
+ 
+ 
+diff -ruN /mnt/data/p2e_original/routes.ts /mnt/data/p2e_rebuild/routes.ts
+--- /mnt/data/p2e_original/routes.ts	2026-09-20 07:23:02.000000000 +0000
++++ /mnt/data/p2e_rebuild/routes.ts	2026-09-21 06:17:19.207326720 +0000
+@@ -1646,16 +1646,20 @@
+     if (!patient.conditions.some((condition) => condition.code === 'HYPERTENSION' && condition.status !== 'INACTIVE')) {
+       res.status(422).json({ error: { code: 'CONDITION_NOT_AVAILABLE', message: 'The current care-plan engine supports hypertension only.' } }); return;
+     }
++    if (enrollment.coordinatorCallStatus !== 'CONTACTED') {
++      res.status(409).json({ error: { code: 'COORDINATOR_CALL_REQUIRED', message: 'The coordinator must contact the patient before the dietitian assessment can start care-plan generation.' } });
++      return;
++    }
+     const assessment = await DietitianAssessment.create({ patientId, clinicOrganizationId: enrollment.clinicOrganizationId, apexcareOrganizationId: auth.organizationId, dietitianUserId: auth.userId, remarks: input.remarks, assessmentData: input.assessmentData });
+     await ApexCareEnrollment.updateOne({ _id: enrollment._id, apexcareOrganizationId: auth.organizationId }, { $set: { dietitianAssessmentStatus: 'COMPLETED' } });
+-    const draft = await generateHypertensionCarePlanDraft(String(enrollment.clinicOrganizationId), patientId, auth.userId);
+-    if (!draft || 'error' in draft) { res.status(422).json({ error: { code: 'CARE_PLAN_GENERATION_BLOCKED', message: 'Care-plan generation could not be started for this patient.' } }); return; }
+-    await ApexCareEnrollment.updateOne({ _id: enrollment._id }, { $set: { carePlanDraftId: draft._id } });
+-    if (draft.clinicianReviewDueAt) {
+-      try { await scheduleCarePlanReviewSla(String(draft._id), draft.clinicianReviewDueAt); }
+-      catch (error) { console.error('Care-plan review SLA could not be scheduled.', error); }
++    try {
++      const jobId = await scheduleHypertensionDraftGeneration(patientId, String(enrollment.clinicOrganizationId), String(patient.assignedClinicianId));
++      res.status(202).json({ data: { assessment, carePlanGenerationStatus: 'QUEUED', jobId } });
++    } catch (error) {
++      await DietitianAssessment.deleteOne({ _id: assessment._id });
++      await ApexCareEnrollment.updateOne({ _id: enrollment._id, apexcareOrganizationId: auth.organizationId }, { $set: { dietitianAssessmentStatus: 'PENDING' } });
++      throw error;
+     }
+-    res.status(201).json({ data: { assessment, draft } });
+   } catch (error) { next(error); }
+ });
+ 
+diff -ruN /mnt/data/p2e_original/workers/reminder.worker.ts /mnt/data/p2e_rebuild/workers/reminder.worker.ts
+--- /mnt/data/p2e_original/workers/reminder.worker.ts	2026-09-20 07:20:22.000000000 +0000
++++ /mnt/data/p2e_rebuild/workers/reminder.worker.ts	2026-09-21 06:17:19.207621946 +0000
+@@ -1,5 +1,5 @@
+ import { Worker } from 'bullmq';
+-import { redisConnection } from '../queues.js';
++import { redisConnection, scheduleCarePlanReviewSla } from '../queues.js';
+ import { ApexCareEnrollment, ApexCareReferral, CarePlanDraft, CareTask, ClinicalReviewCase, ClinicalReviewEvent, MedicationDraft, Patient, PrescriptionDocument } from '../models.js';
+ import { generateHypertensionCarePlanDraft } from '../ai-care-plan.js';
+ import { analyzePrescriptionImage, verifySubmittedMedicationList } from '../prescription-analysis.js';
+@@ -295,11 +295,26 @@
+         clinicianId: string;
+       };
+ 
+-      await generateHypertensionCarePlanDraft(
++      const result = await generateHypertensionCarePlanDraft(
+         organizationId,
+         patientId,
+         clinicianId,
+       );
++      if (!result || 'error' in result) {
++        console.error(JSON.stringify({ type: 'APEXCARE_CARE_PLAN_GENERATION_FAILED', patientId, organizationId, error: result && 'error' in result ? result.error : 'NOT_GENERATED' }));
++        return;
++      }
++      await ApexCareEnrollment.updateOne(
++        { patientId, clinicOrganizationId: organizationId, status: 'ACTIVE' },
++        { $set: { carePlanDraftId: result._id } },
++      );
++      await Patient.updateOne(
++        { _id: patientId, organizationId },
++        { $set: { enrollmentStatus: 'CARE_PLAN_REVIEW' } },
++      );
++      if (result.clinicianReviewDueAt) {
++        await scheduleCarePlanReviewSla(String(result._id), result.clinicianReviewDueAt);
++      }
+     },
+     { connection: redisConnection },
+   );

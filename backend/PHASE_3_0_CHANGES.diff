@@ -1,0 +1,544 @@
+diff -ruN '--exclude=node_modules' '--exclude=package-lock.json' '--exclude=PHASE_3_0_CHANGES.md' /tmp/phase2e_base/ai-care-plan.ts ./ai-care-plan.ts
+--- /tmp/phase2e_base/ai-care-plan.ts	2026-09-21 06:42:01.000000000 +0000
++++ ./ai-care-plan.ts	2026-09-21 11:45:03.654109193 +0000
+@@ -1,3 +1,4 @@
++import { attachCarePlanTasksToExecution, ensureCarePlanExecution } from './care-plan-execution.js';
+ import { ApexCareEnrollment, CarePlan, CarePlanDraft, Patient, VitalRecord, CareTask, OpdVisit, Diagnosis, DietitianAssessment, ProgramConsent } from './models.js';
+ import { env } from './config.js';
+ 
+@@ -267,13 +268,16 @@
+       dueAt.setUTCDate(dueAt.getUTCDate() + task.dueDay);
+       return { type: task.type, title: task.title, dueAt, organizationId, patientId, carePlanId: plan._id };
+     });
+-    await CareTask.insertMany(tasks);
++    const createdTasks = await CareTask.insertMany(tasks);
++    await ensureCarePlanExecution({ organizationId, patientId, carePlanId: String(plan._id) });
++    await attachCarePlanTasksToExecution({ organizationId, patientId, carePlanId: String(plan._id), tasks: createdTasks });
+     draft.status = 'APPROVED';
+     draft.approvedByUserId = clinicianId as never;
+     draft.approvedAt = new Date();
+     await draft.save();
+     return plan;
+   } catch (error) {
++    await CareTask.deleteMany({ _id: { $in: await CareTask.find({ carePlanId: plan._id, organizationId, patientId }).distinct('_id') }, organizationId, patientId, carePlanId: plan._id });
+     await CarePlan.deleteOne({ _id: plan._id, organizationId, patientId });
+     throw error;
+   }
+@@ -309,7 +313,9 @@
+       dueAt.setUTCDate(dueAt.getUTCDate() + task.dueDay);
+       return { type: task.type, title: task.title, dueAt, organizationId, patientId, carePlanId: plan._id };
+     });
+-    await CareTask.insertMany(tasks);
++    const createdTasks = await CareTask.insertMany(tasks);
++    await ensureCarePlanExecution({ organizationId, patientId, carePlanId: String(plan._id) });
++    await attachCarePlanTasksToExecution({ organizationId, patientId, carePlanId: String(plan._id), tasks: createdTasks });
+     draft.status = 'APPROVED';
+     draft.approvedByUserId = apexcareDoctorId as never;
+     draft.approvedAt = new Date();
+@@ -318,6 +324,7 @@
+     await draft.save();
+     return plan;
+   } catch (error) {
++    await CareTask.deleteMany({ _id: { $in: await CareTask.find({ carePlanId: plan._id, organizationId, patientId }).distinct('_id') }, organizationId, patientId, carePlanId: plan._id });
+     await CarePlan.deleteOne({ _id: plan._id, organizationId, patientId });
+     throw error;
+   }
+diff -ruN '--exclude=node_modules' '--exclude=package-lock.json' '--exclude=PHASE_3_0_CHANGES.md' /tmp/phase2e_base/care-plan-execution.ts ./care-plan-execution.ts
+--- /tmp/phase2e_base/care-plan-execution.ts	1970-01-01 00:00:00.000000000 +0000
++++ ./care-plan-execution.ts	2026-09-21 11:42:56.157345845 +0000
+@@ -0,0 +1,126 @@
++import mongoose from 'mongoose';
++import { CarePlan, CarePlanExecution, CarePlanMilestone, CareTask } from './models.js';
++
++export const CARE_PLAN_MILESTONE_DAYS = [0, 3, 7, 14, 30, 60, 90] as const;
++export type CarePlanMilestoneDay = typeof CARE_PLAN_MILESTONE_DAYS[number];
++
++export function milestoneKey(day: number): string {
++  return `DAY_${day}`;
++}
++
++export function taskKey(type: string, title: string, dueAt: Date): string {
++  const normalizedTitle = title.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 100);
++  return `${type}:${normalizedTitle || 'task'}:${dueAt.toISOString().slice(0, 10)}`;
++}
++
++export function getMilestoneDay(startDate: Date, dueAt: Date): number | null {
++  const start = Date.UTC(startDate.getUTCFullYear(), startDate.getUTCMonth(), startDate.getUTCDate());
++  const due = Date.UTC(dueAt.getUTCFullYear(), dueAt.getUTCMonth(), dueAt.getUTCDate());
++  const day = Math.round((due - start) / 86_400_000);
++  return CARE_PLAN_MILESTONE_DAYS.includes(day as CarePlanMilestoneDay) ? day : null;
++}
++
++export async function ensureCarePlanExecution(
++  input: {
++    organizationId: string;
++    patientId: string;
++    carePlanId: string;
++  },
++  session?: mongoose.ClientSession,
++) {
++  const plan = await CarePlan.findOne({
++    _id: input.carePlanId,
++    organizationId: input.organizationId,
++    patientId: input.patientId,
++    status: 'ACTIVE',
++  }).select('_id startDate endDate condition').session(session ?? null).lean();
++
++  if (!plan) return null;
++
++  let execution;
++  try {
++    execution = await CarePlanExecution.findOneAndUpdate(
++      { organizationId: input.organizationId, patientId: input.patientId, carePlanId: input.carePlanId },
++      {
++        $setOnInsert: {
++          organizationId: input.organizationId,
++          patientId: input.patientId,
++          carePlanId: input.carePlanId,
++          condition: plan.condition,
++          status: 'ACTIVE',
++          startDate: plan.startDate,
++          endDate: plan.endDate,
++          activationKey: `care-plan-execution:${input.carePlanId}`,
++        },
++      },
++      { upsert: true, new: true, setDefaultsOnInsert: true, session },
++    );
++  } catch (error) {
++    if ((error as { code?: number })?.code !== 11000) throw error;
++    execution = await CarePlanExecution.findOne({
++      organizationId: input.organizationId,
++      patientId: input.patientId,
++      carePlanId: input.carePlanId,
++    }).session(session ?? null);
++  }
++  if (!execution) throw new Error('CARE_PLAN_EXECUTION_CREATE_FAILED');
++
++  for (const day of CARE_PLAN_MILESTONE_DAYS) {
++    const dueAt = new Date(plan.startDate);
++    dueAt.setUTCDate(dueAt.getUTCDate() + day);
++    await CarePlanMilestone.updateOne(
++      { executionId: execution._id, day },
++      {
++        $setOnInsert: {
++          organizationId: input.organizationId,
++          patientId: input.patientId,
++          carePlanId: input.carePlanId,
++          executionId: execution._id,
++          key: milestoneKey(day),
++          day,
++          dueAt,
++          status: 'PLANNED',
++        },
++      },
++      { upsert: true, session },
++    );
++  }
++
++  return CarePlanExecution.findById(execution._id).session(session ?? null).lean();
++}
++
++export async function attachCarePlanTasksToExecution(
++  input: {
++    organizationId: string;
++    patientId: string;
++    carePlanId: string;
++    tasks: Array<{ _id: mongoose.Types.ObjectId; type: string; title: string; dueAt: Date }>;
++  },
++  session?: mongoose.ClientSession,
++) {
++  const execution = await CarePlanExecution.findOne({
++    organizationId: input.organizationId,
++    patientId: input.patientId,
++    carePlanId: input.carePlanId,
++  }).session(session ?? null).lean();
++  if (!execution) throw new Error('CARE_PLAN_EXECUTION_NOT_FOUND');
++
++  for (const task of input.tasks) {
++    const day = getMilestoneDay(execution.startDate, task.dueAt);
++    const milestone = day === null
++      ? null
++      : await CarePlanMilestone.findOne({ executionId: execution._id, day }).session(session ?? null).lean();
++
++    await CareTask.updateOne(
++      { _id: task._id, organizationId: input.organizationId, patientId: input.patientId, carePlanId: input.carePlanId },
++      {
++        $set: {
++          executionId: execution._id,
++          milestoneId: milestone?._id,
++          taskKey: taskKey(task.type, task.title, task.dueAt),
++        },
++      },
++      { session },
++    );
++  }
++}
+diff -ruN '--exclude=node_modules' '--exclude=package-lock.json' '--exclude=PHASE_3_0_CHANGES.md' /tmp/phase2e_base/models.ts ./models.ts
+--- /tmp/phase2e_base/models.ts	2026-09-21 06:59:09.000000000 +0000
++++ ./models.ts	2026-09-21 11:45:34.165829098 +0000
+@@ -356,6 +356,9 @@
+   organizationId: { type: Schema.Types.ObjectId, ref: 'Organization', required: true, index: true },
+   patientId: { type: Schema.Types.ObjectId, ref: 'Patient', required: true, index: true },
+   carePlanId: { type: Schema.Types.ObjectId, ref: 'CarePlan', required: true, index: true },
++  executionId: { type: Schema.Types.ObjectId, ref: 'CarePlanExecution', index: true },
++  milestoneId: { type: Schema.Types.ObjectId, ref: 'CarePlanMilestone', index: true },
++  taskKey: { type: String, trim: true, maxlength: 220 },
+   type: { type: String, enum: ['OPD_VISIT', 'VITALS', 'LAB', 'MEDICATION', 'DIETITIAN_SESSION', 'FOLLOW_UP'], required: true },
+   title: { type: String, required: true, trim: true, maxlength: 180 },
+   dueAt: { type: Date, required: true, index: true },
+@@ -364,6 +367,55 @@
+   completedByUserId: { type: Schema.Types.ObjectId, ref: 'User' },
+ }, { timestamps: true });
+ careTaskSchema.index({ organizationId: 1, status: 1, dueAt: 1 });
++careTaskSchema.index({ executionId: 1, taskKey: 1 }, { unique: true, partialFilterExpression: { executionId: { $exists: true }, taskKey: { $exists: true } } });
++
++
++const carePlanExecutionSchema = new Schema({
++  organizationId: { type: Schema.Types.ObjectId, ref: 'Organization', required: true, index: true },
++  patientId: { type: Schema.Types.ObjectId, ref: 'Patient', required: true, index: true },
++  carePlanId: { type: Schema.Types.ObjectId, ref: 'CarePlan', required: true, index: true },
++  condition: { type: String, enum: ['HYPERTENSION', 'TYPE_2_DIABETES', 'DYSLIPIDEMIA', 'PCOS'], required: true },
++  status: { type: String, enum: ['ACTIVE', 'PAUSED', 'COMPLETED', 'CANCELLED'], default: 'ACTIVE', index: true },
++  startDate: { type: Date, required: true },
++  endDate: { type: Date, required: true },
++  activationKey: { type: String, required: true, trim: true, maxlength: 200 },
++}, { timestamps: true });
++carePlanExecutionSchema.index({ organizationId: 1, patientId: 1, carePlanId: 1 }, { unique: true });
++carePlanExecutionSchema.index({ organizationId: 1, patientId: 1, status: 1, startDate: -1 });
++carePlanExecutionSchema.index({ activationKey: 1 }, { unique: true });
++
++const carePlanMilestoneSchema = new Schema({
++  organizationId: { type: Schema.Types.ObjectId, ref: 'Organization', required: true, index: true },
++  patientId: { type: Schema.Types.ObjectId, ref: 'Patient', required: true, index: true },
++  carePlanId: { type: Schema.Types.ObjectId, ref: 'CarePlan', required: true, index: true },
++  executionId: { type: Schema.Types.ObjectId, ref: 'CarePlanExecution', required: true, index: true },
++  key: { type: String, required: true, trim: true, maxlength: 40 },
++  day: { type: Number, required: true, min: 0, max: 90 },
++  dueAt: { type: Date, required: true, index: true },
++  status: { type: String, enum: ['PLANNED', 'DUE', 'COMPLETED', 'COMPLETED_EARLY', 'SKIPPED', 'CANCELLED'], default: 'PLANNED', index: true },
++  completedAt: Date,
++  completedByUserId: { type: Schema.Types.ObjectId, ref: 'User' },
++}, { timestamps: true });
++carePlanMilestoneSchema.index({ executionId: 1, day: 1 }, { unique: true });
++carePlanMilestoneSchema.index({ organizationId: 1, patientId: 1, status: 1, dueAt: 1 });
++
++
++const outboxEventSchema = new Schema({
++  organizationId: { type: Schema.Types.ObjectId, ref: 'Organization', required: true, index: true },
++  eventKey: { type: String, required: true, trim: true, maxlength: 300 },
++  eventType: { type: String, required: true, trim: true, maxlength: 120, index: true },
++  aggregateType: { type: String, required: true, trim: true, maxlength: 80 },
++  aggregateId: { type: Schema.Types.ObjectId, required: true, index: true },
++  payload: { type: Schema.Types.Mixed, required: true },
++  status: { type: String, enum: ['PENDING', 'PROCESSING', 'PUBLISHED', 'FAILED'], default: 'PENDING', index: true },
++  attempts: { type: Number, required: true, min: 0, default: 0 },
++  availableAt: { type: Date, required: true, default: Date.now, index: true },
++  publishedAt: Date,
++  lastError: { type: String, trim: true, maxlength: 1000 },
++}, { timestamps: true });
++outboxEventSchema.index({ organizationId: 1, eventKey: 1 }, { unique: true });
++outboxEventSchema.index({ status: 1, availableAt: 1, createdAt: 1 });
++outboxEventSchema.index({ organizationId: 1, status: 1, createdAt: -1 });
+ 
+ const subscriptionSchema = new Schema({
+   organizationId: { type: Schema.Types.ObjectId, ref: 'Organization', required: true, unique: true },
+@@ -591,11 +643,14 @@
+ export const CarePlan = mongoose.model('CarePlan', carePlanSchema);
+ export const CarePlanDraft = mongoose.model('CarePlanDraft', carePlanDraftSchema);
+ export const CareTask = mongoose.model('CareTask', careTaskSchema);
++export const CarePlanExecution = mongoose.model('CarePlanExecution', carePlanExecutionSchema);
++export const CarePlanMilestone = mongoose.model('CarePlanMilestone', carePlanMilestoneSchema);
+ export const VisitReview = mongoose.model(
+   'VisitReview',
+   visitReviewSchema,
+ );
+ export const Subscription = mongoose.model('Subscription', subscriptionSchema);
++export const OutboxEvent = mongoose.model('OutboxEvent', outboxEventSchema);
+ export const ClinicalReviewCase = mongoose.model('ClinicalReviewCase', clinicalReviewCaseSchema);
+ export const ClinicalReviewEvent = mongoose.model('ClinicalReviewEvent', clinicalReviewEventSchema);
+ export const ServiceCase = mongoose.model('ServiceCase', serviceCaseSchema);
+diff -ruN '--exclude=node_modules' '--exclude=package-lock.json' '--exclude=PHASE_3_0_CHANGES.md' /tmp/phase2e_base/outbox.ts ./outbox.ts
+--- /tmp/phase2e_base/outbox.ts	1970-01-01 00:00:00.000000000 +0000
++++ ./outbox.ts	2026-09-21 11:45:34.165946815 +0000
+@@ -0,0 +1,56 @@
++import mongoose from 'mongoose';
++import { OutboxEvent } from './models.js';
++
++export async function enqueueOutboxEvent(input: {
++  organizationId: string;
++  eventKey: string;
++  eventType: string;
++  aggregateType: string;
++  aggregateId: string;
++  payload: Record<string, unknown>;
++}, session?: mongoose.ClientSession) {
++  try {
++    return await OutboxEvent.findOneAndUpdate(
++      { organizationId: input.organizationId, eventKey: input.eventKey },
++      {
++        $setOnInsert: {
++          organizationId: input.organizationId,
++          eventKey: input.eventKey,
++          eventType: input.eventType,
++          aggregateType: input.aggregateType,
++          aggregateId: input.aggregateId,
++          payload: input.payload,
++          status: 'PENDING',
++          attempts: 0,
++          availableAt: new Date(),
++        },
++      },
++      { upsert: true, new: true, setDefaultsOnInsert: true, session },
++    ).lean();
++  } catch (error) {
++    if ((error as { code?: number })?.code !== 11000) throw error;
++    return OutboxEvent.findOne({ organizationId: input.organizationId, eventKey: input.eventKey }).session(session ?? null).lean();
++  }
++}
++
++export async function claimOutboxEvent(eventId: string, now = new Date()) {
++  return OutboxEvent.findOneAndUpdate(
++    { _id: eventId, status: 'PENDING', availableAt: { $lte: now } },
++    { $set: { status: 'PROCESSING' }, $inc: { attempts: 1 } },
++    { new: true },
++  ).lean();
++}
++
++export async function markOutboxPublished(eventId: string) {
++  return OutboxEvent.updateOne(
++    { _id: eventId, status: 'PROCESSING' },
++    { $set: { status: 'PUBLISHED', publishedAt: new Date(), lastError: null } },
++  );
++}
++
++export async function markOutboxFailed(eventId: string, error: unknown, retryAt: Date) {
++  return OutboxEvent.updateOne(
++    { _id: eventId, status: 'PROCESSING' },
++    { $set: { status: 'PENDING', availableAt: retryAt, lastError: error instanceof Error ? error.message.slice(0, 1000) : String(error).slice(0, 1000) } },
++  );
++}
+diff -ruN '--exclude=node_modules' '--exclude=package-lock.json' '--exclude=PHASE_3_0_CHANGES.md' /tmp/phase2e_base/queues.ts ./queues.ts
+--- /tmp/phase2e_base/queues.ts	2026-09-21 06:41:37.000000000 +0000
++++ ./queues.ts	2026-09-21 11:45:03.654359690 +0000
+@@ -153,3 +153,29 @@
+     },
+   );
+ }
++
++
++export async function scheduleCarePlanMilestone(input: {
++  organizationId: string;
++  patientId: string;
++  executionId: string;
++  milestoneId: string;
++  day: number;
++  dueAt: Date;
++}): Promise<string> {
++  const jobId = `care-plan-milestone-${input.executionId}-${input.milestoneId}`;
++  const delay = Math.max(0, input.dueAt.getTime() - Date.now());
++  const job = await apexcareOperationalQueue.add(
++    'care-plan-milestone-due',
++    input,
++    {
++      delay,
++      jobId,
++      removeOnComplete: 1000,
++      removeOnFail: 5000,
++      attempts: 3,
++      backoff: { type: 'exponential', delay: 2000 },
++    },
++  );
++  return String(job.id);
++}
+diff -ruN '--exclude=node_modules' '--exclude=package-lock.json' '--exclude=PHASE_3_0_CHANGES.md' /tmp/phase2e_base/routes.ts ./routes.ts
+--- /tmp/phase2e_base/routes.ts	2026-09-21 06:44:55.000000000 +0000
++++ ./routes.ts	2026-09-21 11:41:39.801004154 +0000
+@@ -1,4 +1,5 @@
+ import bcrypt from 'bcrypt';
++import { ensureCarePlanExecution, attachCarePlanTasksToExecution } from './care-plan-execution.js';
+ import { createHash } from 'node:crypto';
+ import { Router, type NextFunction, type Request, type Response } from 'express';
+ import { z, ZodError } from 'zod';
+@@ -1225,6 +1226,8 @@
+     }
+     const plan = await CarePlan.create({ organizationId: auth.organizationId, patientId: routeParam(req.params.patientId, 'patientId'), condition: input.condition, startDate: input.startDate, endDate, goals: input.goals, createdByUserId: auth.userId });
+     const tasks = await CareTask.insertMany(input.tasks.map((task) => ({ ...task, organizationId: auth.organizationId, patientId: routeParam(req.params.patientId, 'patientId'), carePlanId: plan._id })));
++    await ensureCarePlanExecution({ organizationId: auth.organizationId, patientId: routeParam(req.params.patientId, 'patientId'), carePlanId: String(plan._id) });
++    await attachCarePlanTasksToExecution({ organizationId: auth.organizationId, patientId: routeParam(req.params.patientId, 'patientId'), carePlanId: String(plan._id), tasks });
+     const reminderResults = await Promise.allSettled(tasks.map((task) => scheduleCareTaskReminder(String(task._id), task.dueAt)));
+     if (reminderResults.some((result) => result.status === 'rejected')) {
+       console.error('One or more care-task reminders could not be scheduled.');
+diff -ruN '--exclude=node_modules' '--exclude=package-lock.json' '--exclude=PHASE_3_0_CHANGES.md' /tmp/phase2e_base/tests/phase3.0.test.ts ./tests/phase3.0.test.ts
+--- /tmp/phase2e_base/tests/phase3.0.test.ts	1970-01-01 00:00:00.000000000 +0000
++++ ./tests/phase3.0.test.ts	2026-09-21 11:45:34.165997001 +0000
+@@ -0,0 +1,170 @@
++import mongoose from 'mongoose';
++import { MongoMemoryServer } from 'mongodb-memory-server';
++import { beforeAll, afterAll, beforeEach, describe, expect, it } from 'vitest';
++
++import { CarePlan, CarePlanExecution, CarePlanMilestone, CareTask, Organization, OutboxEvent, Patient, User } from '../models.js';
++import { ensureCarePlanExecution, attachCarePlanTasksToExecution } from '../care-plan-execution.js';
++import { enqueueOutboxEvent } from '../outbox.js';
++
++let mongo: MongoMemoryServer;
++let organizationId: mongoose.Types.ObjectId;
++let otherOrganizationId: mongoose.Types.ObjectId;
++let patientId: mongoose.Types.ObjectId;
++let carePlanId: mongoose.Types.ObjectId;
++let otherCarePlanId: mongoose.Types.ObjectId;
++let userId: mongoose.Types.ObjectId;
++
++beforeAll(async () => {
++  mongo = await MongoMemoryServer.create();
++  await mongoose.connect(mongo.getUri());
++});
++
++afterAll(async () => {
++  await mongoose.disconnect();
++  await mongo.stop();
++});
++
++beforeEach(async () => {
++  await Promise.all([
++    Organization.deleteMany({}), User.deleteMany({}), Patient.deleteMany({}), CarePlan.deleteMany({}),
++    CarePlanExecution.deleteMany({}), CarePlanMilestone.deleteMany({}), CareTask.deleteMany({}), OutboxEvent.deleteMany({}),
++  ]);
++
++  const [organization, otherOrganization, user] = await Promise.all([
++    Organization.create({ name: 'Clinic A', type: 'CLINIC' }),
++    Organization.create({ name: 'Clinic B', type: 'CLINIC' }),
++    User.create({ organizationId: new mongoose.Types.ObjectId(), name: 'placeholder', email: `placeholder-${Date.now()}@example.com`, passwordHash: 'x', roles: ['CLINICIAN'] }),
++  ]);
++  organizationId = organization._id;
++  otherOrganizationId = otherOrganization._id;
++  await User.deleteOne({ _id: user._id });
++  const userDoc = await User.create({ organizationId, name: 'Clinician', email: `clinician-${Date.now()}@example.com`, passwordHash: 'x', roles: ['CLINICIAN'] });
++  userId = userDoc._id;
++  const patient = await Patient.create({
++    organizationId,
++    medicalRecordNumber: `MRN-${Date.now()}`,
++    name: { first: 'Test', last: 'Patient' },
++    assignedClinicianId: userId,
++  });
++  patientId = patient._id;
++  const plan = await CarePlan.create({
++    organizationId,
++    patientId,
++    condition: 'HYPERTENSION',
++    status: 'ACTIVE',
++    startDate: new Date('2026-09-21T00:00:00.000Z'),
++    endDate: new Date('2026-12-20T00:00:00.000Z'),
++    goals: [],
++    createdByUserId: userId,
++  });
++  carePlanId = plan._id;
++  const otherPatient = await Patient.create({
++    organizationId: otherOrganizationId,
++    medicalRecordNumber: `MRN-B-${Date.now()}`,
++    name: { first: 'Other', last: 'Patient' },
++    assignedClinicianId: userId,
++  });
++  const otherUser = await User.create({ organizationId: otherOrganizationId, name: 'Other Clinician', email: `other-${Date.now()}@example.com`, passwordHash: 'x', roles: ['CLINICIAN'] });
++  await Patient.updateOne({ _id: otherPatient._id }, { $set: { assignedClinicianId: otherUser._id } });
++  const otherPlan = await CarePlan.create({
++    organizationId: otherOrganizationId,
++    patientId: otherPatient._id,
++    condition: 'HYPERTENSION',
++    status: 'ACTIVE',
++    startDate: new Date('2026-09-21T00:00:00.000Z'),
++    endDate: new Date('2026-12-20T00:00:00.000Z'),
++    goals: [],
++    createdByUserId: otherUser._id,
++  });
++  otherCarePlanId = otherPlan._id;
++});
++
++describe('Phase 3.0 execution foundation', () => {
++  it('creates exactly one execution and seven deterministic milestones', async () => {
++    const first = await ensureCarePlanExecution({ organizationId: String(organizationId), patientId: String(patientId), carePlanId: String(carePlanId) });
++    const second = await ensureCarePlanExecution({ organizationId: String(organizationId), patientId: String(patientId), carePlanId: String(carePlanId) });
++
++    expect(String(first?._id)).toBe(String(second?._id));
++    expect(await CarePlanExecution.countDocuments({ carePlanId })).toBe(1);
++    expect(await CarePlanMilestone.countDocuments({ carePlanId })).toBe(7);
++    expect(await CarePlanMilestone.find({ carePlanId }).sort({ day: 1 }).distinct('day')).toEqual([0, 3, 7, 14, 30, 60, 90]);
++  });
++
++  it('is safe when two callers attempt execution creation concurrently', async () => {
++    const results = await Promise.all([
++      ensureCarePlanExecution({ organizationId: String(organizationId), patientId: String(patientId), carePlanId: String(carePlanId) }),
++      ensureCarePlanExecution({ organizationId: String(organizationId), patientId: String(patientId), carePlanId: String(carePlanId) }),
++    ]);
++
++    expect(String(results[0]?._id)).toBe(String(results[1]?._id));
++    expect(await CarePlanExecution.countDocuments({ carePlanId })).toBe(1);
++    expect(await CarePlanMilestone.countDocuments({ carePlanId })).toBe(7);
++  });
++
++  it('does not allow one organization to bootstrap another organization execution', async () => {
++    const result = await ensureCarePlanExecution({ organizationId: String(organizationId), patientId: String(patientId), carePlanId: String(otherCarePlanId) });
++    expect(result).toBeNull();
++    expect(await CarePlanExecution.countDocuments({ carePlanId: otherCarePlanId })).toBe(0);
++  });
++
++  it('attaches tasks deterministically to matching milestones', async () => {
++    await ensureCarePlanExecution({ organizationId: String(organizationId), patientId: String(patientId), carePlanId: String(carePlanId) });
++    const task = await CareTask.create({
++      organizationId,
++      patientId,
++      carePlanId,
++      type: 'OPD_VISIT',
++      title: 'Day 30 review',
++      dueAt: new Date('2026-10-21T00:00:00.000Z'),
++    });
++
++    await attachCarePlanTasksToExecution({ organizationId: String(organizationId), patientId: String(patientId), carePlanId: String(carePlanId), tasks: [task] });
++    const updated = await CareTask.findById(task._id).lean();
++    const milestone = await CarePlanMilestone.findOne({ carePlanId, day: 30 }).lean();
++
++    expect(String(updated?.executionId)).toBe(String(milestone?.executionId));
++    expect(String(updated?.milestoneId)).toBe(String(milestone?._id));
++    expect(updated?.taskKey).toContain('OPD_VISIT:day-30-review:2026-10-21');
++  });
++
++  it('does not allow a duplicate logical task inside one execution', async () => {
++    await ensureCarePlanExecution({ organizationId: String(organizationId), patientId: String(patientId), carePlanId: String(carePlanId) });
++    const first = await CareTask.create({
++      organizationId,
++      patientId,
++      carePlanId,
++      type: 'OPD_VISIT',
++      title: 'Day 30 review',
++      dueAt: new Date('2026-10-21T00:00:00.000Z'),
++      executionId: (await CarePlanExecution.findOne({ carePlanId }))!._id,
++      taskKey: 'OPD_VISIT:day-30-review:2026-10-21',
++    });
++    expect(first._id).toBeDefined();
++    await expect(CareTask.create({
++      organizationId,
++      patientId,
++      carePlanId,
++      type: 'OPD_VISIT',
++      title: 'Day 30 review duplicate',
++      dueAt: new Date('2026-10-21T00:00:00.000Z'),
++      executionId: first.executionId,
++      taskKey: 'OPD_VISIT:day-30-review:2026-10-21',
++    })).rejects.toMatchObject({ code: 11000 });
++  });
++
++  it('does not duplicate an outbox event when the same logical event is enqueued twice', async () => {
++    const input = {
++      organizationId: String(organizationId),
++      eventKey: `care-task-reminder:${carePlanId}:task-1`,
++      eventType: 'CARE_TASK_REMINDER_SCHEDULE',
++      aggregateType: 'CarePlan',
++      aggregateId: String(carePlanId),
++      payload: { taskId: 'task-1' },
++    };
++    const first = await enqueueOutboxEvent(input);
++    const second = await enqueueOutboxEvent(input);
++
++    expect(String(first?._id)).toBe(String(second?._id));
++    expect(await OutboxEvent.countDocuments({ eventKey: input.eventKey })).toBe(1);
++  });
++});

@@ -1,0 +1,650 @@
+--- a/.env.example
+
++++ b/.env.example
+
+@@ -4,3 +4,4 @@
+
+ JWT_ACCESS_SECRET=replace-with-a-long-random-secret-at-least-32-characters
+ JWT_ACCESS_TTL=15m
+ CORS_ORIGINS=http://localhost:3000,http://localhost:8081
++REDIS_URL=redis://localhost:6379
+--- a/README.md
+
++++ b/README.md
+
+@@ -15,7 +15,7 @@
+
+ ## Run locally
+ 
+ 1. Copy `.env.example` to `.env` and set a long random JWT secret.
+-2. Start MongoDB with `docker compose up -d mongo`.
++2. Start MongoDB and Redis with `docker compose up -d mongo redis`.
+ 3. Run `npm install`.
+ 4. Run `npm run dev`.
+ 
+@@ -32,3 +32,16 @@
+
+ - `POST /patients/:patientId/care-plans`
+ - `GET /patients/:patientId/care-plans`
+ - `GET /subscription`
++- `GET|POST /clinic-team` — clinic admin manages clinician/coordinator accounts only
++- `PATCH /clinic-team/:userId/status`
++- `PATCH /me/password` — first-login temporary-password change
++- `POST|GET /patients/:patientId/vitals`
++- `POST|GET /patients/:patientId/opd-visits`
++- `PATCH /care-tasks/:taskId/complete`
++- `GET /care-queue`
++- `PATCH /patients/:patientId/care-plans/:carePlanId`
++- `POST|GET /patients/:patientId/service-cases` — clinic requests Apexcare dietitian/endocrinology support
++- `GET /apexcare/service-cases` — Apexcare service queue
++- `PATCH /apexcare/service-cases/:caseId/assign`
++- `PATCH /apexcare/service-cases/:caseId/status`
++- `npm run worker` — BullMQ reminder worker
+--- a/app.ts
+
++++ b/app.ts
+
+@@ -3,7 +3,7 @@
+
+ import helmet from 'helmet';
+ import pinoHttp from 'pino-http';
+ import { allowedOrigins, env } from './config.js';
+-import { requireAuth, requireRoles } from './auth.js';
++import { requireAuth } from './auth.js';
+ import { isKnownValidationError, protectedRouter, publicRouter } from './routes.js';
+ 
+ export const app = express();
+@@ -15,7 +15,7 @@
+
+ 
+ app.get('/health', (_req, res) => res.status(200).json({ status: 'ok' }));
+ app.use('/api/v1', publicRouter);
+-app.use('/api/v1', requireAuth, requireRoles('CLINIC_ADMIN', 'CLINICIAN', 'CLINIC_COORDINATOR'), protectedRouter);
++app.use('/api/v1', requireAuth, protectedRouter);
+ 
+ app.use((_req, res) => res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Route not found.' } }));
+ app.use((error: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+--- a/config.ts
+
++++ b/config.ts
+
+@@ -8,6 +8,7 @@
+
+   JWT_ACCESS_SECRET: z.string().min(32),
+   JWT_ACCESS_TTL: z.string().default('15m'),
+   CORS_ORIGINS: z.string().default('http://localhost:3000'),
++  REDIS_URL: z.string().default('redis://localhost:6379'),
+ });
+ 
+ export const env = envSchema.parse(process.env);
+--- a/package.json
+
++++ b/package.json
+
+@@ -7,9 +7,12 @@
+
+     "dev": "tsx watch server.ts",
+     "build": "tsc -p tsconfig.json",
+     "start": "node dist/server.js",
+-    "typecheck": "tsc --noEmit"
++    "typecheck": "tsc --noEmit",
++    "worker": "tsx workers/reminder.worker.ts"
+   },
+-  "engines": { "node": ">=20" },
++  "engines": {
++    "node": ">=20"
++  },
+   "dependencies": {
+     "bcrypt": "^6.0.0",
+     "cors": "^2.8.5",
+@@ -19,7 +22,9 @@
+
+     "jsonwebtoken": "^9.0.2",
+     "mongoose": "^8.15.0",
+     "pino-http": "^10.3.0",
+-    "zod": "^3.24.4"
++    "zod": "^3.24.4",
++    "bullmq": "^5.58.5",
++    "ioredis": "^5.6.1"
+   },
+   "devDependencies": {
+     "@types/bcrypt": "^5.0.2",
+--- a/queues.ts
+
++++ b/queues.ts
+
+@@ -0,0 +1,28 @@
+
++import { Queue } from 'bullmq';
++import IORedis from 'ioredis';
++import { env } from './config.js';
++
++export const redisConnection = new IORedis(env.REDIS_URL, {
++  maxRetriesPerRequest: null,
++});
++
++export const reminderQueue = new Queue('apexcare-reminders', {
++  connection: redisConnection,
++});
++
++export async function scheduleCareTaskReminder(taskId: string, dueAt: Date): Promise<void> {
++  const reminderAt = new Date(dueAt);
++  reminderAt.setHours(reminderAt.getHours() - 24);
++  const delay = Math.max(0, reminderAt.getTime() - Date.now());
++
++  await reminderQueue.add(
++    'care-task-due',
++    { taskId },
++    {
++      delay,
++      jobId: `care-task-${taskId}`,
++      removeOnComplete: 1000,
++      removeOnFail: 5000,
++    },
++  );
++}
+--- a/routes.ts
+
++++ b/routes.ts
+
+@@ -2,7 +2,8 @@
+
+ import { Router, type Request, type Response } from 'express';
+ import { z, ZodError } from 'zod';
+ import { issueAccessToken, requireRoles, type AuthenticatedRequest } from './auth.js';
+-import { CarePlan, CareTask, Organization, Patient, Subscription, User, type Role } from './models.js';
++import { scheduleCareTaskReminder } from './queues.js';
++import { CarePlan, CareTask, Organization, Patient, Subscription, User, VitalRecord, OpdVisit, ServiceCase, type Role } from './models.js';
+ 
+ const conditionCodes = ['HYPERTENSION', 'TYPE_2_DIABETES', 'DYSLIPIDEMIA', 'PCOS'] as const;
+ 
+@@ -13,6 +14,7 @@
+
+   password: z.string().min(12).max(128),
+ });
+ const loginSchema = z.object({ email: z.string().email(), password: z.string().min(1) });
++const passwordChangeSchema = z.object({ currentPassword: z.string().min(1), newPassword: z.string().min(12).max(128) });
+ const patientSchema = z.object({
+   medicalRecordNumber: z.string().trim().min(1).max(64),
+   name: z.object({ first: z.string().trim().min(1).max(80), last: z.string().trim().max(80).optional() }),
+@@ -29,6 +31,63 @@
+
+   })).min(1),
+   communicationConsent: z.literal(true),
+ });
++const staffCreateSchema = z.object({
++  name: z.string().trim().min(2).max(120),
++  email: z.string().email(),
++  role: z.enum(['CLINICIAN', 'CLINIC_COORDINATOR']),
++  temporaryPassword: z.string().min(12).max(128),
++});
++
++const staffStatusSchema = z.object({ status: z.enum(['ACTIVE', 'SUSPENDED']) });
++
++const vitalRecordSchema = z.object({
++  recordedAt: z.coerce.date().default(() => new Date()),
++  source: z.enum(['OPD', 'HOME', 'DEVICE']).default('OPD'),
++  bloodPressure: z.object({
++    systolic: z.coerce.number().min(40).max(300),
++    diastolic: z.coerce.number().min(20).max(200),
++    pulse: z.coerce.number().min(20).max(250).optional(),
++  }).optional(),
++  bloodSugar: z.object({
++    value: z.coerce.number().min(10).max(1000),
++    type: z.enum(['FASTING', 'POST_PRANDIAL', 'RANDOM', 'HBA1C']),
++    unit: z.enum(['MG_DL', 'PERCENT']).default('MG_DL'),
++  }).optional(),
++  weightKg: z.coerce.number().min(1).max(500).optional(),
++  symptoms: z.array(z.string().trim().min(1).max(120)).max(20).default([]),
++  notes: z.string().trim().max(2000).optional(),
++}).refine((value) => value.bloodPressure || value.bloodSugar || value.weightKg || value.symptoms.length > 0, {
++  message: 'At least one vital or symptom is required.',
++});
++
++const opdVisitSchema = z.object({
++  visitAt: z.coerce.date().default(() => new Date()),
++  clinicianId: z.string().regex(/^[a-f\d]{24}$/i),
++  reason: z.string().trim().max(500).optional(),
++  assessment: z.string().trim().max(5000).optional(),
++  planAdjustment: z.string().trim().max(5000).optional(),
++  carePlanId: z.string().regex(/^[a-f\d]{24}$/i).optional(),
++  vitals: vitalRecordSchema.optional(),
++});
++
++const carePlanAdjustmentSchema = z.object({
++  goals: z.array(z.object({
++    title: z.string().trim().min(1).max(180),
++    target: z.string().trim().max(120).optional(),
++    unit: z.string().trim().max(32).optional(),
++  })).max(10).optional(),
++  status: z.enum(['DRAFT', 'ACTIVE', 'PAUSED', 'COMPLETED', 'CANCELLED']).optional(),
++});
++
++const taskCompleteSchema = z.object({
++  status: z.enum(['COMPLETED', 'SKIPPED']).default('COMPLETED'),
++});
++
++const serviceCaseSchema = z.object({
++  service: z.enum(['DIETITIAN', 'ENDOCRINOLOGY']),
++  reason: z.string().trim().max(1000).optional(),
++});
++
+ const deactivatePatientSchema = z.object({ status: z.literal('INACTIVE') });
+ const carePlanSchema = z.object({
+   condition: z.enum(conditionCodes),
+@@ -58,6 +117,65 @@
+
+ 
+ export const publicRouter = Router();
+ export const protectedRouter = Router();
++
++protectedRouter.get('/clinic-team', requireRoles('CLINIC_ADMIN'), async (req: Request, res, next) => {
++  try {
++    const auth = authContext(req);
++    const staff = await User.find({
++      organizationId: auth.organizationId,
++      roles: { $in: ['CLINICIAN', 'CLINIC_COORDINATOR'] },
++    }).select('_id name email roles status mustChangePassword createdAt').sort({ name: 1 }).lean();
++    res.json({ data: staff });
++  } catch (error) { next(error); }
++});
++
++protectedRouter.post('/clinic-team', requireRoles('CLINIC_ADMIN'), async (req: Request, res, next) => {
++  try {
++    const auth = authContext(req);
++    const input = parseOrReply(staffCreateSchema, req.body, res);
++    if (!input) return;
++    const passwordHash = await bcrypt.hash(input.temporaryPassword, 12);
++    const user = await User.create({
++      organizationId: auth.organizationId,
++      name: input.name,
++      email: input.email,
++      passwordHash,
++      roles: [input.role],
++      mustChangePassword: true,
++    });
++    res.status(201).json({
++      data: {
++        id: user.id,
++        name: user.name,
++        email: user.email,
++        roles: user.roles,
++        status: user.status,
++        mustChangePassword: true,
++      },
++    });
++  } catch (error) {
++    if (isDuplicateKey(error)) {
++      res.status(409).json({ error: { code: 'STAFF_EMAIL_EXISTS', message: 'A staff account with this email already exists in this clinic.' } }); return;
++    }
++    next(error);
++  }
++});
++
++protectedRouter.patch('/clinic-team/:userId/status', requireRoles('CLINIC_ADMIN'), async (req: Request, res, next) => {
++  try {
++    const input = parseOrReply(staffStatusSchema, req.body, res);
++    if (!input) return;
++    const auth = authContext(req);
++    const user = await User.findOneAndUpdate(
++      { _id: req.params.userId, organizationId: auth.organizationId, roles: { $in: ['CLINICIAN', 'CLINIC_COORDINATOR'] } },
++      { $set: { status: input.status } },
++      { new: true },
++    ).select('_id name email roles status mustChangePassword');
++    if (!user) { res.status(404).json({ error: { code: 'STAFF_NOT_FOUND', message: 'Clinic staff account not found.' } }); return; }
++    res.json({ data: user });
++  } catch (error) { next(error); }
++});
++
+ 
+ publicRouter.post('/auth/register-organization', async (req: Request, res: Response, next) => {
+   try {
+@@ -97,7 +215,7 @@
+
+       res.status(401).json({ error: { code: 'INVALID_CREDENTIALS', message: 'Invalid email or password.' } }); return;
+     }
+     const token = issueAccessToken({ userId: user.id, organizationId: String(user.organizationId), roles: user.roles as Role[] });
+-    res.json({ data: { accessToken: token, user: { id: user.id, name: user.name, email: user.email, roles: user.roles } } });
++    res.json({ data: { accessToken: token, user: { id: user.id, name: user.name, email: user.email, roles: user.roles, mustChangePassword: user.mustChangePassword } } });
+   } catch (error) { next(error); }
+ });
+ 
+@@ -109,14 +227,31 @@
+
+   } catch (error) { next(error); }
+ });
+ 
+-protectedRouter.get('/patients', async (req: Request, res, next) => {
++
++protectedRouter.patch('/me/password', async (req: Request, res, next) => {
++  try {
++    const input = parseOrReply(passwordChangeSchema, req.body, res);
++    if (!input) return;
++    const auth = authContext(req);
++    const user = await User.findOne({ _id: auth.userId, organizationId: auth.organizationId }).select('+passwordHash');
++    if (!user || !(await bcrypt.compare(input.currentPassword, user.passwordHash))) {
++      res.status(401).json({ error: { code: 'INVALID_PASSWORD', message: 'Current password is incorrect.' } }); return;
++    }
++    user.passwordHash = await bcrypt.hash(input.newPassword, 12);
++    user.mustChangePassword = false;
++    await user.save();
++    res.json({ data: { success: true, mustChangePassword: false } });
++  } catch (error) { next(error); }
++});
++
++protectedRouter.get('/patients', requireRoles('CLINIC_ADMIN', 'CLINICIAN', 'CLINIC_COORDINATOR'), async (req: Request, res, next) => {
+   try {
+     const patients = await Patient.find({ organizationId: authContext(req).organizationId, status: 'ACTIVE' }).sort({ createdAt: -1 }).limit(100).lean();
+     res.json({ data: patients });
+   } catch (error) { next(error); }
+ });
+ 
+-protectedRouter.get('/subscription', async (req: Request, res, next) => {
++protectedRouter.get('/subscription', requireRoles('CLINIC_ADMIN'), async (req: Request, res, next) => {
+   try {
+     const subscription = await Subscription.findOne({ organizationId: authContext(req).organizationId }).lean();
+     if (!subscription) { res.status(404).json({ error: { code: 'SUBSCRIPTION_NOT_FOUND', message: 'Subscription not found.' } }); return; }
+@@ -135,7 +270,7 @@
+
+     if (!subscription) { res.status(402).json({ error: { code: 'PATIENT_LIMIT_REACHED', message: 'Your active-patient plan limit has been reached. Upgrade the plan to enrol another patient.' } }); return; }
+     let patient;
+     try {
+-      patient = await Patient.create({ ...input, organizationId: auth.organizationId, programmeConsent: { acceptedAt: new Date(), acceptedByUserId: auth.userId, communicationConsent: input.communicationConsent } });
++      patient = await Patient.create({ ...input, organizationId: auth.organizationId, enrolledByUserId: auth.userId, programmeConsent: { acceptedAt: new Date(), acceptedByUserId: auth.userId, communicationConsent: input.communicationConsent } });
+     } catch (error) {
+       await Subscription.updateOne({ _id: subscription._id, activePatientCount: { $gt: 0 } }, { $inc: { activePatientCount: -1 } });
+       throw error;
+@@ -147,7 +282,7 @@
+
+   }
+ });
+ 
+-protectedRouter.get('/patients/:patientId', async (req: Request, res, next) => {
++protectedRouter.get('/patients/:patientId', requireRoles('CLINIC_ADMIN', 'CLINICIAN', 'CLINIC_COORDINATOR'), async (req: Request, res, next) => {
+   try {
+     const patient = await Patient.findOne({ _id: req.params.patientId, organizationId: authContext(req).organizationId }).lean();
+     if (!patient) { res.status(404).json({ error: { code: 'PATIENT_NOT_FOUND', message: 'Patient not found.' } }); return; }
+@@ -171,6 +306,135 @@
+
+   } catch (error) { next(error); }
+ });
+ 
++
++protectedRouter.post('/patients/:patientId/vitals', requireRoles('CLINIC_ADMIN', 'CLINICIAN', 'CLINIC_COORDINATOR'), async (req: Request, res, next) => {
++  try {
++    const auth = authContext(req);
++    const input = parseOrReply(vitalRecordSchema, req.body, res);
++    if (!input) return;
++    const patient = await Patient.exists({ _id: req.params.patientId, organizationId: auth.organizationId, status: 'ACTIVE' });
++    if (!patient) { res.status(404).json({ error: { code: 'PATIENT_NOT_FOUND', message: 'Patient not found.' } }); return; }
++    const record = await VitalRecord.create({ ...input, organizationId: auth.organizationId, patientId: req.params.patientId, recordedByUserId: auth.userId });
++    res.status(201).json({ data: record });
++  } catch (error) { next(error); }
++});
++
++protectedRouter.get('/patients/:patientId/vitals', requireRoles('CLINIC_ADMIN', 'CLINICIAN', 'CLINIC_COORDINATOR'), async (req: Request, res, next) => {
++  try {
++    const records = await VitalRecord.find({ patientId: req.params.patientId, organizationId: authContext(req).organizationId }).sort({ recordedAt: -1 }).limit(100).lean();
++    res.json({ data: records });
++  } catch (error) { next(error); }
++});
++
++protectedRouter.post('/patients/:patientId/opd-visits', requireRoles('CLINICIAN', 'CLINIC_COORDINATOR'), async (req: Request, res, next) => {
++  try {
++    const auth = authContext(req);
++    const input = parseOrReply(opdVisitSchema, req.body, res);
++    if (!input) return;
++    const patient = await Patient.exists({ _id: req.params.patientId, organizationId: auth.organizationId, status: 'ACTIVE' });
++    if (!patient) { res.status(404).json({ error: { code: 'PATIENT_NOT_FOUND', message: 'Patient not found.' } }); return; }
++    const clinician = await User.exists({ _id: input.clinicianId, organizationId: auth.organizationId, status: 'ACTIVE', roles: 'CLINICIAN' });
++    if (!clinician) { res.status(422).json({ error: { code: 'INVALID_CLINICIAN', message: 'Visit clinician is not active in this clinic.' } }); return; }
++
++    let vitalsRecordId;
++    if (input.vitals) {
++      const vital = await VitalRecord.create({
++        ...input.vitals,
++        organizationId: auth.organizationId,
++        patientId: req.params.patientId,
++        recordedByUserId: auth.userId,
++      });
++      vitalsRecordId = vital._id;
++    }
++
++    const visit = await OpdVisit.create({
++      organizationId: auth.organizationId,
++      patientId: req.params.patientId,
++      visitAt: input.visitAt,
++      recordedByUserId: auth.userId,
++      clinicianId: input.clinicianId,
++      reason: input.reason,
++      assessment: input.assessment,
++      planAdjustment: input.planAdjustment,
++      carePlanId: input.carePlanId,
++      vitalsRecordId,
++    });
++    res.status(201).json({ data: visit });
++  } catch (error) { next(error); }
++});
++
++protectedRouter.get('/patients/:patientId/opd-visits', requireRoles('CLINIC_ADMIN', 'CLINICIAN', 'CLINIC_COORDINATOR'), async (req: Request, res, next) => {
++  try {
++    const visits = await OpdVisit.find({ patientId: req.params.patientId, organizationId: authContext(req).organizationId }).sort({ visitAt: -1 }).limit(100).lean();
++    res.json({ data: visits });
++  } catch (error) { next(error); }
++});
++
++protectedRouter.patch('/care-tasks/:taskId/complete', requireRoles('CLINIC_ADMIN', 'CLINICIAN', 'CLINIC_COORDINATOR'), async (req: Request, res, next) => {
++  try {
++    const input = parseOrReply(taskCompleteSchema, req.body, res);
++    if (!input) return;
++    const auth = authContext(req);
++    const task = await CareTask.findOneAndUpdate(
++      { _id: req.params.taskId, organizationId: auth.organizationId },
++      { $set: { status: input.status, completedAt: input.status === 'COMPLETED' ? new Date() : undefined, completedByUserId: auth.userId } },
++      { new: true },
++    ).lean();
++    if (!task) { res.status(404).json({ error: { code: 'TASK_NOT_FOUND', message: 'Care task not found.' } }); return; }
++    res.json({ data: task });
++  } catch (error) { next(error); }
++});
++
++protectedRouter.get('/care-queue', requireRoles('CLINIC_ADMIN', 'CLINIC_COORDINATOR'), async (req: Request, res, next) => {
++  try {
++    const auth = authContext(req);
++    const now = new Date();
++    await CareTask.updateMany(
++      { organizationId: auth.organizationId, status: 'PENDING', dueAt: { $lt: now } },
++      { $set: { status: 'OVERDUE' } },
++    );
++    const tasks = await CareTask.find({
++      organizationId: auth.organizationId,
++      status: { $in: ['OVERDUE', 'PENDING'] },
++    }).sort({ dueAt: 1 }).limit(200).lean();
++    res.json({ data: tasks });
++  } catch (error) { next(error); }
++});
++
++protectedRouter.patch('/patients/:patientId/care-plans/:carePlanId', requireRoles('CLINICIAN'), async (req: Request, res, next) => {
++  try {
++    const input = parseOrReply(carePlanAdjustmentSchema, req.body, res);
++    if (!input) return;
++    const auth = authContext(req);
++    const plan = await CarePlan.findOneAndUpdate(
++      { _id: req.params.carePlanId, patientId: req.params.patientId, organizationId: auth.organizationId },
++      { $set: { ...(input.goals !== undefined ? { goals: input.goals } : {}), ...(input.status ? { status: input.status } : {}), lastAdjustedByUserId: auth.userId, lastAdjustedAt: new Date() }, $inc: { version: 1 } },
++      { new: true },
++    );
++    if (!plan) { res.status(404).json({ error: { code: 'CARE_PLAN_NOT_FOUND', message: 'Care plan not found.' } }); return; }
++    res.json({ data: plan });
++  } catch (error) { next(error); }
++});
++
++protectedRouter.post('/patients/:patientId/service-cases', requireRoles('CLINIC_ADMIN', 'CLINICIAN', 'CLINIC_COORDINATOR'), async (req: Request, res, next) => {
++  try {
++    const input = parseOrReply(serviceCaseSchema, req.body, res);
++    if (!input) return;
++    const auth = authContext(req);
++    const patient = await Patient.exists({ _id: req.params.patientId, organizationId: auth.organizationId, status: 'ACTIVE' });
++    if (!patient) { res.status(404).json({ error: { code: 'PATIENT_NOT_FOUND', message: 'Patient not found.' } }); return; }
++    const serviceCase = await ServiceCase.create({ ...input, organizationId: auth.organizationId, patientId: req.params.patientId, requestedByUserId: auth.userId });
++    res.status(201).json({ data: serviceCase });
++  } catch (error) { next(error); }
++});
++
++protectedRouter.get('/service-cases', requireRoles('CLINIC_ADMIN', 'CLINICIAN', 'CLINIC_COORDINATOR'), async (req: Request, res, next) => {
++  try {
++    const cases = await ServiceCase.find({ organizationId: authContext(req).organizationId }).sort({ createdAt: -1 }).limit(100).lean();
++    res.json({ data: cases });
++  } catch (error) { next(error); }
++});
++
+ protectedRouter.post('/patients/:patientId/care-plans', requireRoles('CLINICIAN'), async (req: Request, res, next) => {
+   try {
+     const auth = authContext(req);
+@@ -185,14 +449,70 @@
+
+     }
+     const plan = await CarePlan.create({ organizationId: auth.organizationId, patientId: req.params.patientId, condition: input.condition, startDate: input.startDate, endDate, goals: input.goals, createdByUserId: auth.userId });
+     const tasks = await CareTask.insertMany(input.tasks.map((task) => ({ ...task, organizationId: auth.organizationId, patientId: req.params.patientId, carePlanId: plan._id })));
++    const reminderResults = await Promise.allSettled(tasks.map((task) => scheduleCareTaskReminder(String(task._id), task.dueAt)));
++    if (reminderResults.some((result) => result.status === 'rejected')) {
++      console.error('One or more care-task reminders could not be scheduled.');
++    }
+     res.status(201).json({ data: { plan, tasks } });
+   } catch (error) { next(error); }
+ });
+ 
+-protectedRouter.get('/patients/:patientId/care-plans', async (req: Request, res, next) => {
++protectedRouter.get('/patients/:patientId/care-plans', requireRoles('CLINIC_ADMIN', 'CLINICIAN', 'CLINIC_COORDINATOR'), async (req: Request, res, next) => {
+   try {
+     const plans = await CarePlan.find({ patientId: req.params.patientId, organizationId: authContext(req).organizationId }).sort({ startDate: -1 }).lean();
+     res.json({ data: plans });
++  } catch (error) { next(error); }
++});
++
++
++protectedRouter.get('/apexcare/service-cases', requireRoles('APEXCARE_COORDINATOR', 'APEXCARE_DIETITIAN', 'APEXCARE_SPECIALIST'), async (req: Request, res, next) => {
++  try {
++    const auth = authContext(req);
++    const filter: Record<string, unknown> = {};
++    if (auth.roles.includes('APEXCARE_DIETITIAN')) filter.service = 'DIETITIAN';
++    if (auth.roles.includes('APEXCARE_SPECIALIST')) filter.service = 'ENDOCRINOLOGY';
++    if (!auth.roles.includes('APEXCARE_COORDINATOR') && !auth.roles.includes('APEXCARE_DIETITIAN') && !auth.roles.includes('APEXCARE_SPECIALIST')) {
++      res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Apexcare role required.' } }); return;
++    }
++    const cases = await ServiceCase.find({
++      ...filter,
++      ...(auth.roles.includes('APEXCARE_COORDINATOR') ? {} : { assignedApexcareUserId: auth.userId }),
++    }).sort({ createdAt: -1 }).limit(200).lean();
++    res.json({ data: cases });
++  } catch (error) { next(error); }
++});
++
++protectedRouter.patch('/apexcare/service-cases/:caseId/assign', requireRoles('APEXCARE_COORDINATOR'), async (req: Request, res, next) => {
++  try {
++    const input = z.object({ assignedApexcareUserId: z.string().regex(/^[a-f\d]{24}$/i) }).safeParse(req.body);
++    if (!input.success) { res.status(422).json({ error: { code: 'VALIDATION_ERROR', message: 'A valid Apexcare assignee is required.', details: input.error.flatten() } }); return; }
++    const auth = authContext(req);
++    const serviceCase = await ServiceCase.findOne({ _id: req.params.caseId });
++    if (!serviceCase) { res.status(404).json({ error: { code: 'SERVICE_CASE_NOT_FOUND', message: 'Service case not found.' } }); return; }
++    const role = serviceCase.service === 'DIETITIAN' ? 'APEXCARE_DIETITIAN' : 'APEXCARE_SPECIALIST';
++    const assignee = await User.exists({ _id: input.data.assignedApexcareUserId, organizationId: auth.organizationId, status: 'ACTIVE', roles: role });
++    if (!assignee) { res.status(422).json({ error: { code: 'INVALID_APEXCARE_ASSIGNEE', message: 'The assignee is not an active Apexcare team member for this service.' } }); return; }
++    serviceCase.assignedApexcareUserId = input.data.assignedApexcareUserId as any;
++    serviceCase.status = 'ASSIGNED';
++    await serviceCase.save();
++    res.json({ data: serviceCase });
++  } catch (error) { next(error); }
++});
++
++protectedRouter.patch('/apexcare/service-cases/:caseId/status', requireRoles('APEXCARE_COORDINATOR', 'APEXCARE_DIETITIAN', 'APEXCARE_SPECIALIST'), async (req: Request, res, next) => {
++  try {
++    const input = z.object({ status: z.enum(['SCHEDULED', 'COMPLETED', 'CANCELLED']), handoffSummary: z.string().trim().max(5000).optional() }).safeParse(req.body);
++    if (!input.success) { res.status(422).json({ error: { code: 'VALIDATION_ERROR', message: 'Invalid service-case status update.', details: input.error.flatten() } }); return; }
++    const auth = authContext(req);
++    const serviceCase = await ServiceCase.findOne({ _id: req.params.caseId });
++    if (!serviceCase) { res.status(404).json({ error: { code: 'SERVICE_CASE_NOT_FOUND', message: 'Service case not found.' } }); return; }
++    const isCoordinator = auth.roles.includes('APEXCARE_COORDINATOR');
++    const isAssigned = String(serviceCase.assignedApexcareUserId || '') === auth.userId;
++    if (!isCoordinator && !isAssigned) { res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Only the assigned Apexcare provider or coordinator can update this case.' } }); return; }
++    serviceCase.status = input.data.status;
++    if (input.data.handoffSummary !== undefined) serviceCase.handoffSummary = input.data.handoffSummary;
++    await serviceCase.save();
++    res.json({ data: serviceCase });
+   } catch (error) { next(error); }
+ });
+ 
+--- a/workers/reminder.worker.ts
+
++++ b/workers/reminder.worker.ts
+
+@@ -0,0 +1,38 @@
+
++import { Worker } from 'bullmq';
++import { redisConnection } from '../queues.js';
++import { CareTask } from '../models.js';
++
++const worker = new Worker(
++  'apexcare-reminders',
++  async (job) => {
++    if (job.name !== 'care-task-due') return;
++
++    const task = await CareTask.findById(job.data.taskId).lean();
++    if (!task || !['PENDING', 'OVERDUE'].includes(task.status)) return;
++
++    // Channel delivery (WhatsApp/SMS/push) belongs in the notification adapter.
++    // For this first workflow, the worker makes the reminder event reliable and
++    // observable without coupling the core API to a messaging provider.
++    console.log(JSON.stringify({
++      type: 'CARE_TASK_REMINDER_DUE',
++      taskId: String(task._id),
++      patientId: String(task.patientId),
++      organizationId: String(task.organizationId),
++      dueAt: task.dueAt,
++      taskType: task.type,
++    }));
++  },
++  { connection: redisConnection },
++);
++
++worker.on('completed', (job) => console.log(`Reminder job completed: ${job.id}`));
++worker.on('failed', (job, error) => console.error(`Reminder job failed: ${job?.id}`, error));
++
++const shutdown = async () => {
++  await worker.close();
++  await redisConnection.quit();
++  process.exit(0);
++};
++
++process.once('SIGINT', shutdown);
++process.once('SIGTERM', shutdown);
+
+# Phase 2D change log
+
+- models.ts
+  - Added ClinicalReviewCase with clinic/ApexCare organization boundaries, assigned clinic clinician, ApexCare assignment, 24-hour SLA, status, decision, and review timestamps.
+  - Added ClinicalReviewEvent as an append-only audit trail for clinical-review state transitions.
+  - Added indexes for clinic clinician queues, ApexCare queues, and assigned-case lookup.
+
+- clinical-review.ts (new)
+  - Added shared clinical-review lifecycle helpers for opening, approving, rejecting, and escalating medication review cases.
+  - Approval only promotes the existing medication draft to VERIFIED; it does not alter medication content.
+
+- queues.ts
+  - Added the clinical-review SLA BullMQ job scheduler.
+
+- workers/reminder.worker.ts
+  - Opens clinical-review cases for AI discrepancies and terminal prescription AI failures.
+  - Escalates unresolved clinic review cases to ApexCare after 24 hours.
+  - Records system-generated escalation audit events.
+
+- routes.ts
+  - Added clinic clinical-review queue/detail/decision endpoints.
+  - Added ApexCare doctor queue/claim/detail/decision endpoints.
+  - Added an unresolved-review guard before medication finalization.
+  - Added clinical-review creation when verification cannot be queued.
+  - Restricted ApexCare prescription-image access to active clinical-review cases.
+
+- tests/security.test.ts
+  - Added Phase 2D tenant, role, assignment, approval, finalization-gate, and ApexCare organization-isolation tests.
+  - Added an ApexCare doctor fixture and clinical-review test fixtures.
